@@ -169,6 +169,10 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.workload_recorder import (
+    WorkloadRecorder,
+    build_workload_record,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
@@ -342,6 +346,15 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        workload_record_path = envs.SGLANG_WORKLOAD_RECORD_PATH.get()
+        self.workload_recorder = (
+            WorkloadRecorder(workload_record_path)
+            if workload_record_path
+            and self.ps.tp_rank == 0
+            and self.ps.pp_rank == 0
+            and not is_draft_worker
+            else None
+        )
         # The process entry published; a draft runner is not one (it must not
         # clobber the target's config), so only the target checks.
         if not is_draft_worker:
@@ -1646,6 +1659,17 @@ class ModelRunner:
 
         # Step span
         step_span_ctx = profile_range(build_step_span_name(forward_batch))
+        workload_record = (
+            build_workload_record(
+                forward_batch,
+                forward_pass_id=self.forward_pass_id,
+                tp_rank=self.ps.tp_rank,
+                pp_rank=self.ps.pp_rank,
+                gpu_id=self.gpu_id,
+            )
+            if self.workload_recorder is not None
+            else None
+        )
 
         canary_ctx = (
             context_tuple(
@@ -1682,6 +1706,15 @@ class ModelRunner:
                     split_forward_count,
                 )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
+        if workload_record is not None:
+            workload_record["execution"] = (
+                "cuda_graph" if output.can_run_graph else "eager"
+            )
+            if output.can_run_graph and forward_batch.forward_mode.is_cuda_graph():
+                workload_record["graph_batch_size"] = getattr(
+                    self.decode_cuda_graph_runner, "bs", None
+                )
+            self.workload_recorder.write(workload_record)
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
         if (

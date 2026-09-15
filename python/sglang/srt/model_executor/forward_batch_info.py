@@ -68,6 +68,8 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
+_WORKLOAD_RECORDING_ENABLED = bool(envs.SGLANG_WORKLOAD_RECORD_PATH.get())
+
 if TYPE_CHECKING:
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
@@ -502,6 +504,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    # CPU-only request metadata for workload census and debugging. These lists
+    # preserve ScheduleBatch request order and never require device sync.
+    original_input_lens_cpu: Optional[List[int]] = None
+    remaining_prefill_tokens_cpu: Optional[List[int]] = None
+    is_final_prefill_chunk_cpu: Optional[List[bool]] = None
+    prefill_chunk_indices_cpu: Optional[List[int]] = None
+    is_context_request_cpu: Optional[List[bool]] = None
+    cache_device_hit_tokens_cpu: Optional[List[int]] = None
+    cache_host_hit_tokens_cpu: Optional[List[int]] = None
+    cache_storage_hit_tokens_cpu: Optional[List[int]] = None
+    cache_recompute_tokens_cpu: Optional[List[int]] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -811,6 +824,79 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
+        if _WORKLOAD_RECORDING_ENABLED:
+            is_context_request_cpu = [
+                batch.forward_mode.is_extend_without_speculative()
+                and not (
+                    batch.forward_mode.is_mixed()
+                    and batch.decoding_reqs is not None
+                    and req in batch.decoding_reqs
+                )
+                for req in batch.reqs
+            ]
+            original_input_lens_cpu = [
+                len(req.origin_input_ids) for req in batch.reqs
+            ]
+            remaining_prefill_tokens_cpu = [
+                max(
+                    0,
+                    len(req.full_untruncated_fill_ids) - req.extend_range.end,
+                )
+                if is_context_request_cpu[i]
+                else 0
+                for i, req in enumerate(batch.reqs)
+            ]
+            is_final_prefill_chunk_cpu = [
+                len(req.full_untruncated_fill_ids) <= req.extend_range.end
+                if is_context_request_cpu[i]
+                else True
+                for i, req in enumerate(batch.reqs)
+            ]
+            prefill_chunk_indices_cpu = [
+                max(0, req.extend_batch_idx - 1)
+                if is_context_request_cpu[i]
+                else 0
+                for i, req in enumerate(batch.reqs)
+            ]
+            cache_device_hit_tokens_cpu = [
+                req.cached_tokens_device
+                if is_context_request_cpu[i]
+                and req.extend_batch_idx == 1
+                and not req.retracted_stain
+                else 0
+                for i, req in enumerate(batch.reqs)
+            ]
+            cache_host_hit_tokens_cpu = [
+                req.cached_tokens_host
+                if is_context_request_cpu[i]
+                and req.extend_batch_idx == 1
+                and not req.retracted_stain
+                else 0
+                for i, req in enumerate(batch.reqs)
+            ]
+            cache_storage_hit_tokens_cpu = [
+                req.cached_tokens_storage
+                if is_context_request_cpu[i]
+                and req.extend_batch_idx == 1
+                and not req.retracted_stain
+                else 0
+                for i, req in enumerate(batch.reqs)
+            ]
+            cache_recompute_tokens_cpu = [
+                int(batch.extend_lens[i]) if is_context_request_cpu[i] else 0
+                for i, _ in enumerate(batch.reqs)
+            ]
+        else:
+            is_context_request_cpu = None
+            original_input_lens_cpu = None
+            remaining_prefill_tokens_cpu = None
+            is_final_prefill_chunk_cpu = None
+            prefill_chunk_indices_cpu = None
+            cache_device_hit_tokens_cpu = None
+            cache_host_hit_tokens_cpu = None
+            cache_storage_hit_tokens_cpu = None
+            cache_recompute_tokens_cpu = None
+
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
@@ -855,6 +941,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            original_input_lens_cpu=original_input_lens_cpu,
+            remaining_prefill_tokens_cpu=remaining_prefill_tokens_cpu,
+            is_final_prefill_chunk_cpu=is_final_prefill_chunk_cpu,
+            prefill_chunk_indices_cpu=prefill_chunk_indices_cpu,
+            is_context_request_cpu=is_context_request_cpu,
+            cache_device_hit_tokens_cpu=cache_device_hit_tokens_cpu,
+            cache_host_hit_tokens_cpu=cache_host_hit_tokens_cpu,
+            cache_storage_hit_tokens_cpu=cache_storage_hit_tokens_cpu,
+            cache_recompute_tokens_cpu=cache_recompute_tokens_cpu,
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
