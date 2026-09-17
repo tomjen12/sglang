@@ -68,7 +68,16 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
-_WORKLOAD_RECORDING_ENABLED = bool(envs.SGLANG_WORKLOAD_RECORD_PATH.get())
+_PREFILL_WORKLOAD_RECORDING_ENABLED = bool(
+    envs.SGLANG_WORKLOAD_RECORD_PREFILL_PATH.get()
+)
+_ALL_FORWARD_WORKLOAD_RECORDING_ENABLED = bool(
+    envs.SGLANG_WORKLOAD_RECORD_ALL_PATH.get()
+)
+_WORKLOAD_RECORDING_ENABLED = (
+    _PREFILL_WORKLOAD_RECORDING_ENABLED
+    or _ALL_FORWARD_WORKLOAD_RECORDING_ENABLED
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
@@ -515,6 +524,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     cache_host_hit_tokens_cpu: Optional[List[int]] = None
     cache_storage_hit_tokens_cpu: Optional[List[int]] = None
     cache_recompute_tokens_cpu: Optional[List[int]] = None
+    mamba_state_slot_present_cpu: Optional[List[bool]] = None
+    mamba_track_mask_cpu: Optional[List[bool]] = None
+    mamba_track_seqlens_cpu: Optional[List[int]] = None
+    mamba_cow_count_cpu: int = 0
+    mamba_clear_count_cpu: int = 0
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -826,7 +840,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if _WORKLOAD_RECORDING_ENABLED:
             is_context_request_cpu = [
-                batch.forward_mode.is_extend_without_speculative()
+                batch.forward_mode.is_extend_or_draft_extend_or_mixed(
+                    include_draft_extend_v2=True
+                )
                 and not (
                     batch.forward_mode.is_mixed()
                     and batch.decoding_reqs is not None
@@ -834,6 +850,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
                 for req in batch.reqs
             ]
+        else:
+            is_context_request_cpu = None
+
+        if _PREFILL_WORKLOAD_RECORDING_ENABLED:
             original_input_lens_cpu = [
                 len(req.origin_input_ids) for req in batch.reqs
             ]
@@ -886,8 +906,36 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 int(batch.extend_lens[i]) if is_context_request_cpu[i] else 0
                 for i, _ in enumerate(batch.reqs)
             ]
+            state_slot_present = [
+                bool(req.kv.holds_mamba) for req in batch.reqs
+            ]
+            mamba_state_slot_present_cpu = (
+                state_slot_present
+                if any(state_slot_present)
+                or batch.mamba_track_indices is not None
+                else None
+            )
+            mamba_track_mask_cpu = (
+                list(batch.mamba_track_mask_cpu)
+                if batch.mamba_track_mask_cpu is not None
+                else None
+            )
+            mamba_track_seqlens_cpu = (
+                list(batch.mamba_track_seqlens_cpu)
+                if batch.mamba_track_seqlens_cpu is not None
+                else None
+            )
+            mamba_cow_count_cpu = (
+                int(batch.mamba_cow_src_indices.numel())
+                if batch.mamba_cow_src_indices is not None
+                else 0
+            )
+            mamba_clear_count_cpu = (
+                int(batch.mamba_clear_indices.numel())
+                if batch.mamba_clear_indices is not None
+                else 0
+            )
         else:
-            is_context_request_cpu = None
             original_input_lens_cpu = None
             remaining_prefill_tokens_cpu = None
             is_final_prefill_chunk_cpu = None
@@ -896,6 +944,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             cache_host_hit_tokens_cpu = None
             cache_storage_hit_tokens_cpu = None
             cache_recompute_tokens_cpu = None
+            mamba_state_slot_present_cpu = None
+            mamba_track_mask_cpu = None
+            mamba_track_seqlens_cpu = None
+            mamba_cow_count_cpu = 0
+            mamba_clear_count_cpu = 0
 
         ret = cls(
             # Required core inputs
@@ -950,6 +1003,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             cache_host_hit_tokens_cpu=cache_host_hit_tokens_cpu,
             cache_storage_hit_tokens_cpu=cache_storage_hit_tokens_cpu,
             cache_recompute_tokens_cpu=cache_recompute_tokens_cpu,
+            mamba_state_slot_present_cpu=mamba_state_slot_present_cpu,
+            mamba_track_mask_cpu=mamba_track_mask_cpu,
+            mamba_track_seqlens_cpu=mamba_track_seqlens_cpu,
+            mamba_cow_count_cpu=mamba_cow_count_cpu,
+            mamba_clear_count_cpu=mamba_clear_count_cpu,
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,

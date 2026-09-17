@@ -2303,6 +2303,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask_cpu: Optional[List[bool]] = None  # shape: [b]
+    mamba_track_seqlens_cpu: Optional[List[int]] = None  # shape: [b], prefill only
     mamba_track_mask_next_cpu: Optional[List[bool]] = None  # shape: [b]
     mamba_decode_batch_idx_cpu: Optional[List[int]] = None  # shape: [b]
     # Lazy + spec: this iteration's per-req scatter positions
@@ -2805,6 +2806,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         if get_exec().mamba.enable_mamba_extra_buffer:
+            self.mamba_track_mask_cpu = list(mamba_track_mask_cpu)
+            self.mamba_track_seqlens_cpu = list(mamba_track_seqlens_cpu)
             self.mamba_track_indices = torch.tensor(
                 mamba_track_indices_cpu,
                 dtype=torch.int64,
@@ -3366,6 +3369,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
+        self.mamba_track_seqlens_cpu = None
 
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
@@ -3513,6 +3517,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
         self.mamba_track_mask_cpu = None
+        self.mamba_track_seqlens_cpu = None
         self.mamba_track_mask_next_cpu = None
         self.mamba_decode_batch_idx_cpu = None
         self.mamba_lazy_spec_track_positions_cpu = None
@@ -3579,6 +3584,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
         self.mamba_track_mask_cpu = None
+        self.mamba_track_seqlens_cpu = None
         self.mamba_track_mask_next_cpu = None
         self.mamba_decode_batch_idx_cpu = None
         self.mamba_lazy_spec_track_positions_cpu = None
@@ -3642,6 +3648,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
             mamba_track_mask_cpu=self.mamba_track_mask_cpu,
+            mamba_track_seqlens_cpu=self.mamba_track_seqlens_cpu,
             mamba_track_mask_next_cpu=self.mamba_track_mask_next_cpu,
             mamba_decode_batch_idx_cpu=self.mamba_decode_batch_idx_cpu,
             mamba_lazy_spec_track_positions_cpu=self.mamba_lazy_spec_track_positions_cpu,

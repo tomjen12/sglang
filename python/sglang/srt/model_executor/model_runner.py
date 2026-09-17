@@ -80,6 +80,7 @@ from sglang.srt.layers.cp.utils import (
     is_mla_cp_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.route_replay import has_moe_route_replay_provider
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
@@ -170,8 +171,11 @@ from sglang.srt.model_executor.runner import (
     get_batch_sizes_to_capture,
 )
 from sglang.srt.model_executor.workload_recorder import (
-    WorkloadRecorder,
-    build_workload_record,
+    PrefillWorkloadRecorder,
+    build_forward_workload_record,
+    build_prefill_workload_record,
+    get_or_create_forward_workload_recorder,
+    set_global_prefill_workload_recorder,
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -346,15 +350,25 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
-        workload_record_path = envs.SGLANG_WORKLOAD_RECORD_PATH.get()
+        all_forward_record_path = envs.SGLANG_WORKLOAD_RECORD_ALL_PATH.get()
+        self.forward_workload_recorder = (
+            get_or_create_forward_workload_recorder(all_forward_record_path)
+            if all_forward_record_path
+            and self.ps.tp_rank == 0
+            and self.ps.pp_rank == 0
+            else None
+        )
+        prefill_record_path = envs.SGLANG_WORKLOAD_RECORD_PREFILL_PATH.get()
         self.workload_recorder = (
-            WorkloadRecorder(workload_record_path)
-            if workload_record_path
+            PrefillWorkloadRecorder(prefill_record_path)
+            if prefill_record_path
             and self.ps.tp_rank == 0
             and self.ps.pp_rank == 0
             and not is_draft_worker
             else None
         )
+        if self.workload_recorder is not None:
+            set_global_prefill_workload_recorder(self.workload_recorder)
         # The process entry published; a draft runner is not one (it must not
         # clobber the target's config), so only the target checks.
         if not is_draft_worker:
@@ -702,6 +716,19 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+        if self.workload_recorder is not None:
+            self.workload_recorder.configure(
+                model_config=self.model_config,
+                server_args=self.server_args,
+                parallel_state=self.ps,
+                gpu_id=self.gpu_id,
+                kv_cache_dtype=self.kv_cache_dtype,
+            )
+        if self.forward_workload_recorder is not None and not self.is_draft_worker:
+            self.forward_workload_recorder.configure(
+                server_args=self.server_args,
+                parallel_state=self.ps,
+            )
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -1659,8 +1686,21 @@ class ModelRunner:
 
         # Step span
         step_span_ctx = profile_range(build_step_span_name(forward_batch))
+        forward_workload_record = (
+            build_forward_workload_record(
+                forward_batch,
+                forward_pass_id=self.forward_pass_id,
+                tp_rank=self.ps.tp_rank,
+                pp_rank=self.ps.pp_rank,
+                gpu_id=self.gpu_id,
+                model_role="draft" if self.is_draft_worker else "target",
+                draft_model_idx=self.draft_model_idx,
+            )
+            if self.forward_workload_recorder is not None
+            else None
+        )
         workload_record = (
-            build_workload_record(
+            build_prefill_workload_record(
                 forward_batch,
                 forward_pass_id=self.forward_pass_id,
                 tp_rank=self.ps.tp_rank,
@@ -1670,6 +1710,8 @@ class ModelRunner:
             if self.workload_recorder is not None
             else None
         )
+        if self.workload_recorder is not None:
+            self.workload_recorder.begin(workload_record)
 
         canary_ctx = (
             context_tuple(
@@ -1683,38 +1725,90 @@ class ModelRunner:
             else contextlib.nullcontext()
         )
 
-        with (
-            canary_ctx,
-            step_span_ctx,
-            get_global_expert_distribution_recorder().with_forward_pass(
-                self.forward_pass_id,
-                forward_batch,
-            ) as recorder_outputs,
-        ):
-            output = self._forward_raw(
-                forward_batch,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
-            )
-            if self.enable_elastic_ep:
-                output = self._maybe_rebalance_after_rank_fault(
-                    output,
+        try:
+            with (
+                canary_ctx,
+                step_span_ctx,
+                get_global_expert_distribution_recorder().with_forward_pass(
+                    self.forward_pass_id,
+                    forward_batch,
+                ) as recorder_outputs,
+            ):
+                output = self._forward_raw(
                     forward_batch,
                     pp_proxy_tensors,
                     reinit_attn_backend,
                     split_forward_count,
                 )
+                if self.enable_elastic_ep:
+                    output = self._maybe_rebalance_after_rank_fault(
+                        output,
+                        forward_batch,
+                        pp_proxy_tensors,
+                        reinit_attn_backend,
+                        split_forward_count,
+                    )
+        except BaseException:
+            if self.workload_recorder is not None:
+                self.workload_recorder.abort()
+            if forward_workload_record is not None:
+                completed_ns = time.time_ns()
+                forward_workload_record["completed_timestamp_ns"] = completed_ns
+                forward_workload_record["host_elapsed_ns"] = (
+                    completed_ns - forward_workload_record["timestamp_ns"]
+                )
+                forward_workload_record["status"] = "failed"
+                self.forward_workload_recorder.write(forward_workload_record)
+            raise
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
+        if forward_workload_record is not None:
+            completed_ns = time.time_ns()
+            forward_workload_record["completed_timestamp_ns"] = completed_ns
+            forward_workload_record["host_elapsed_ns"] = (
+                completed_ns - forward_workload_record["timestamp_ns"]
+            )
+            forward_workload_record["status"] = "completed"
+            forward_workload_record["execution"] = (
+                "cuda_graph" if output.can_run_graph else "eager"
+            )
+            if output.can_run_graph:
+                graph_runner = (
+                    self.decode_cuda_graph_runner
+                    if forward_batch.forward_mode.is_cuda_graph()
+                    else self.prefill_cuda_graph_runner
+                )
+                forward_workload_record["graph_batch_size"] = getattr(
+                    graph_runner,
+                    "bs",
+                    getattr(graph_runner, "last_graph_batch_size", None),
+                )
+                forward_workload_record["graph_num_tokens"] = getattr(
+                    graph_runner,
+                    "last_graph_num_tokens",
+                    getattr(graph_runner, "raw_num_token", None),
+                )
+            self.forward_workload_recorder.write(forward_workload_record)
         if workload_record is not None:
             workload_record["execution"] = (
                 "cuda_graph" if output.can_run_graph else "eager"
             )
+            dspark_prefill = workload_record.get("dspark_prefill")
+            if isinstance(dspark_prefill, dict):
+                hidden_states = getattr(
+                    output.logits_output, "hidden_states", None
+                )
+                if hidden_states is not None:
+                    dspark_prefill["target_hidden_shape"] = [
+                        int(value) for value in hidden_states.shape
+                    ]
+                    dspark_prefill["target_hidden_dtype"] = str(
+                        hidden_states.dtype
+                    ).removeprefix("torch.")
             if output.can_run_graph and forward_batch.forward_mode.is_cuda_graph():
                 workload_record["graph_batch_size"] = getattr(
                     self.decode_cuda_graph_runner, "bs", None
                 )
-            self.workload_recorder.write(workload_record)
+            self.workload_recorder.finish(workload_record)
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
         if (
@@ -1863,6 +1957,8 @@ class ModelRunner:
                 )
             elif (
                 forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                and self.workload_recorder is None
+                and not has_moe_route_replay_provider()
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)

@@ -347,9 +347,11 @@ class Envs:
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
-    # Opt-in per-forward workload census. The TP/PP rank-zero target worker
-    # appends one compact JSON object per completed model forward.
-    SGLANG_WORKLOAD_RECORD_PATH = EnvStr("")
+    # Opt-in prefill workload census. The TP/PP rank-zero target worker writes
+    # request shapes plus per-layer MoE counts into this output directory.
+    SGLANG_WORKLOAD_RECORD_PREFILL_PATH = EnvStr("")
+    # Independent lightweight timeline for every target and draft model forward.
+    SGLANG_WORKLOAD_RECORD_ALL_PATH = EnvStr("")
     SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)
 
     # ===================================================================
@@ -459,6 +461,12 @@ class Envs:
     # precedence when both are set.
     SGLANG_GRAPH_BATCH_CAPTURE = EnvBool(False)
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
+    # Emit one CPU+GPU Chrome trace for every live DSpark target EXTEND.
+    # This is intended for correctness analysis, not latency measurement.
+    SGLANG_EXTEND_KERNEL_TRACE = EnvBool(False)
+    SGLANG_EXTEND_KERNEL_TRACE_DIR = EnvStr(
+        "/tmp/sglang_extend_kernel_traces"
+    )
     # Allocator-history buffer for /start_profile activities=["MEM"]; the
     # default truncates long windows (each entry is one alloc/free event).
     SGLANG_MEM_PROFILE_MAX_ENTRIES = EnvInt(100000)

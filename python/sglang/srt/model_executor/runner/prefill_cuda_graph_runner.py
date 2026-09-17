@@ -573,6 +573,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.raw_num_tokens = 0
         self.raw_bs = 0
+        self.last_graph_batch_size = 0
+        self.last_graph_num_tokens = 0
 
     def _is_mamba_track_enabled(self) -> bool:
         return get_exec().mamba.enable_mamba_extra_buffer and (
@@ -1922,6 +1924,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         with self.backend.replay_session():
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
+            self.last_graph_batch_size = int(static_forward_batch.batch_size)
+            self.last_graph_num_tokens = int(static_num_tokens)
             raw_num_tokens = self.raw_num_tokens
             shape_key = self._shape_key(static_num_tokens, forward_batch)
             # The only variants this runner records are chunked-prefix ones.

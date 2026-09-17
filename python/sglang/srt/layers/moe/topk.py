@@ -104,7 +104,12 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     is_moe_input_scattered_across_dp_ranks,
 )
+from sglang.srt.layers.moe.route_replay import (
+    has_moe_route_replay_provider,
+    maybe_replay_topk,
+)
 from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
+from sglang.srt.model_executor.workload_recorder import record_prefill_topk
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -2535,6 +2540,9 @@ def select_experts(
             num_token_shards=num_token_shards,
         )
 
+    if packed_topk is not None and has_moe_route_replay_provider():
+        raise RuntimeError("MoE route replay does not support packed top-k output")
+    topk_weights, topk_ids = maybe_replay_topk(layer_id, topk_weights, topk_ids)
     topk_ids, topk_weights, recorder_topk_ids = _post_process_topk_ids(
         topk_ids=topk_ids,
         topk_weights=topk_weights,
@@ -2548,6 +2556,7 @@ def select_experts(
     get_global_expert_distribution_recorder().on_select_experts(
         topk_ids=recorder_topk_ids
     )
+    record_prefill_topk(layer_id, recorder_topk_ids)
 
     # ===== TO BE REFACTORED ====
     if packed_topk is not None:
@@ -2594,8 +2603,10 @@ def build_precomputed_topk_output(
 
     Only valid when :func:`precomputed_topk_postprocess_is_noop` holds.
     """
+    topk_weights, topk_ids = maybe_replay_topk(layer_id, topk_weights, topk_ids)
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+    record_prefill_topk(layer_id, topk_ids)
     # router_logits is only read by the BYPASSED formats and by the
     # shared-expert append (excluded above); STANDARD consumers take ids/weights.
     return StandardTopKOutput(topk_weights, topk_ids, None)

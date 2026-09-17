@@ -22,6 +22,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
+from sglang.srt.model_executor.extend_kernel_tracer import ExtendKernelTracer
+from sglang.srt.model_executor.workload_recorder import (
+    commit_prefill_dspark_injection,
+    prefill_workload_execution_context,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -144,6 +149,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.model_runner = target_worker.model_runner
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
+        self._extend_kernel_tracer = ExtendKernelTracer(
+            enabled=envs.SGLANG_EXTEND_KERNEL_TRACE.get(),
+            output_dir=envs.SGLANG_EXTEND_KERNEL_TRACE_DIR.get(),
+            tp_rank=self.ps.tp_rank,
+            device=self.device,
+        )
 
         self._draft_is_moe = draft_is_deepseek_v4()
         self._draft_dp_context_enabled = (
@@ -516,7 +527,29 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
-            return self._forward_prefill(batch, on_publish)
+            if batch.forward_mode != ForwardMode.EXTEND:
+                return self._forward_prefill(batch, on_publish)
+
+            source_forward_id = int(self.model_runner.forward_pass_id) + 1
+            with self._extend_kernel_tracer.capture(
+                source_forward_id=source_forward_id,
+                request_ids=[
+                    str(getattr(req, "rid", "")) for req in batch.reqs
+                ],
+                query_sizes=list(batch.extend_lens or []),
+                prefix_kv_sizes=list(batch.prefix_lens or []),
+            ):
+                output = self._forward_prefill(batch, on_publish)
+            if (
+                self._extend_kernel_tracer.enabled
+                and int(self.model_runner.forward_pass_id) != source_forward_id
+            ):
+                raise RuntimeError(
+                    "DSpark EXTEND trace forward ID did not match the target "
+                    f"model forward: expected {source_forward_id}, got "
+                    f"{self.model_runner.forward_pass_id}"
+                )
+            return output
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
 
@@ -530,10 +563,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
-        batch_output = self.target_worker.forward_batch_generation(
-            batch, capture_hidden_mode=CaptureHiddenMode.FULL
-        )
-        # BCG replay skips model-side Python, so re-evaluate the same pure predicate.
+        draft_pool = self.draft_model_runner.token_to_kv_pool
+        if hasattr(draft_pool, "set_swa_key_buffer_radix_fused_norm_rope"):
+            injection_backend = (
+                "unified_kv_triton"
+                if is_unified_kv_triton()
+                else "dsv4_swa_mapping"
+            )
+        else:
+            injection_backend = "draft_model_write_target_hidden_kv"
         target_hidden_is_projected = (
             self._target_hidden_projection_enabled
             and self.target_worker.model_runner.model.should_project_dspark_target_hidden(
@@ -541,6 +579,31 @@ class DSparkWorkerV2(BaseSpecWorker):
                 capture_hidden_mode=CaptureHiddenMode.FULL,
             )
         )
+        workload_context = {
+            "wrapper": "dspark_prefill",
+            "dspark_prefill": {
+                "enabled": True,
+                "target_hidden_projection_enabled": bool(
+                    target_hidden_is_projected
+                ),
+                "target_hidden_shape": None,
+                "target_hidden_dtype": None,
+                "kv_injection_backend": injection_backend,
+                "kv_injection_token_count": (
+                    int(batch.out_cache_loc.numel())
+                    if batch.out_cache_loc is not None
+                    else int(sum(batch.extend_lens or []))
+                ),
+                "tp_sync_enabled": self._tp_sync.enabled(
+                    SpecTpSyncSite.DSPARK_TARGET
+                ),
+                "draft_kv_injection_enabled": True,
+            },
+        }
+        with prefill_workload_execution_context(workload_context):
+            batch_output = self.target_worker.forward_batch_generation(
+                batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            )
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_TARGET, next_token_ids)
@@ -590,13 +653,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             final_pos = torch.repeat_interleave(
                 (draft_seq_lens + ctx_lens - 1).to(torch.int64), repeats
             )
-        self._kv_injector.inject_target_hidden(
-            target_hidden=logits_output.hidden_states,
-            cache_loc=batch.out_cache_loc,
-            positions=positions,
-            state_slot=state_slot,
-            final_pos=final_pos,
-            target_hidden_is_projected=target_hidden_is_projected,
+        try:
+            self._kv_injector.inject_target_hidden(
+                target_hidden=logits_output.hidden_states,
+                cache_loc=batch.out_cache_loc,
+                positions=positions,
+                state_slot=state_slot,
+                final_pos=final_pos,
+                target_hidden_is_projected=target_hidden_is_projected,
+            )
+        except BaseException:
+            commit_prefill_dspark_injection(
+                self.model_runner.forward_pass_id, status="failed"
+            )
+            raise
+        commit_prefill_dspark_injection(
+            self.model_runner.forward_pass_id, status="completed"
         )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
