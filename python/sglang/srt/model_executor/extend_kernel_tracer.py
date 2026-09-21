@@ -24,11 +24,15 @@ class ExtendKernelTracer:
         output_dir: str,
         tp_rank: int,
         device: torch.device,
+        arm_file: str = "",
     ) -> None:
         self.enabled = bool(enabled) and tp_rank == 0
         self.tp_rank = int(tp_rank)
         self.device = device
         self.output_dir = Path(output_dir).expanduser()
+        self.arm_file = (
+            Path(arm_file).expanduser() if arm_file else None
+        )
         self.manifest_path = self.output_dir / "manifest.jsonl"
         if self.enabled:
             self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -42,7 +46,9 @@ class ExtendKernelTracer:
         query_sizes: Sequence[int],
         prefix_kv_sizes: Sequence[int],
     ) -> Iterator[None]:
-        if not self.enabled:
+        if not self.enabled or (
+            self.arm_file is not None and not self.arm_file.is_file()
+        ):
             yield
             return
 

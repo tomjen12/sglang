@@ -513,6 +513,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    # Normalized per-request sampler settings. Kept on CPU so workload
+    # recording does not synchronize sampling tensors from the GPU.
+    sampling_params_cpu: Optional[List[dict[str, Any]]] = None
     # CPU-only request metadata for workload census and debugging. These lists
     # preserve ScheduleBatch request order and never require device sync.
     original_input_lens_cpu: Optional[List[int]] = None
@@ -994,6 +997,35 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            sampling_params_cpu=[
+                {
+                    "temperature": float(req.sampling_params.temperature),
+                    "top_p": float(req.sampling_params.top_p),
+                    "top_k": int(req.sampling_params.top_k),
+                    "min_p": float(req.sampling_params.min_p),
+                    "frequency_penalty": float(
+                        req.sampling_params.frequency_penalty
+                    ),
+                    "presence_penalty": float(
+                        req.sampling_params.presence_penalty
+                    ),
+                    "repetition_penalty": float(
+                        req.sampling_params.repetition_penalty
+                    ),
+                    "min_new_tokens": int(req.sampling_params.min_new_tokens),
+                    "max_new_tokens": (
+                        int(req.sampling_params.max_new_tokens)
+                        if req.sampling_params.max_new_tokens is not None
+                        else None
+                    ),
+                    "sampling_seed": (
+                        int(req.sampling_params.sampling_seed)
+                        if req.sampling_params.sampling_seed is not None
+                        else None
+                    ),
+                }
+                for req in batch.reqs
+            ],
             original_input_lens_cpu=original_input_lens_cpu,
             remaining_prefill_tokens_cpu=remaining_prefill_tokens_cpu,
             is_final_prefill_chunk_cpu=is_final_prefill_chunk_cpu,

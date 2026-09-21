@@ -25,6 +25,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.extend_kernel_tracer import ExtendKernelTracer
 from sglang.srt.model_executor.workload_recorder import (
     commit_prefill_dspark_injection,
+    dspark_prefill_gpu_timing,
     prefill_workload_execution_context,
 )
 from sglang.srt.runtime_context import (
@@ -154,6 +155,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             output_dir=envs.SGLANG_EXTEND_KERNEL_TRACE_DIR.get(),
             tp_rank=self.ps.tp_rank,
             device=self.device,
+            arm_file=envs.SGLANG_EXTEND_KERNEL_TRACE_ARM_FILE.get(),
         )
 
         self._draft_is_moe = draft_is_deepseek_v4()
@@ -538,7 +540,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ],
                 query_sizes=list(batch.extend_lens or []),
                 prefix_kv_sizes=list(batch.prefix_lens or []),
-            ):
+            ), dspark_prefill_gpu_timing(source_forward_id, self.device):
                 output = self._forward_prefill(batch, on_publish)
             if (
                 self._extend_kernel_tracer.enabled

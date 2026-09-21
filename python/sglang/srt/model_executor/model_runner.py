@@ -351,8 +351,15 @@ class ModelRunner:
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
         all_forward_record_path = envs.SGLANG_WORKLOAD_RECORD_ALL_PATH.get()
+        workload_gpu_timing_enabled = (
+            envs.SGLANG_WORKLOAD_RECORD_GPU_TIMING.get()
+            and bool(all_forward_record_path)
+        )
         self.forward_workload_recorder = (
-            get_or_create_forward_workload_recorder(all_forward_record_path)
+            get_or_create_forward_workload_recorder(
+                all_forward_record_path,
+                gpu_timing_enabled=workload_gpu_timing_enabled,
+            )
             if all_forward_record_path
             and self.ps.tp_rank == 0
             and self.ps.pp_rank == 0
@@ -360,7 +367,10 @@ class ModelRunner:
         )
         prefill_record_path = envs.SGLANG_WORKLOAD_RECORD_PREFILL_PATH.get()
         self.workload_recorder = (
-            PrefillWorkloadRecorder(prefill_record_path)
+            PrefillWorkloadRecorder(
+                prefill_record_path,
+                gpu_timing_enabled=workload_gpu_timing_enabled,
+            )
             if prefill_record_path
             and self.ps.tp_rank == 0
             and self.ps.pp_rank == 0
@@ -1724,6 +1734,12 @@ class ModelRunner:
             if not self.is_draft_worker and ((c := self.canary_manager) is not None)
             else contextlib.nullcontext()
         )
+        model_gpu_timing = (
+            self.forward_workload_recorder.start_gpu_timing(self.device)
+            if self.forward_workload_recorder is not None
+            and self.forward_workload_recorder.gpu_timing_enabled
+            else None
+        )
 
         try:
             with (
@@ -1749,6 +1765,10 @@ class ModelRunner:
                         split_forward_count,
                     )
         except BaseException:
+            if model_gpu_timing is not None:
+                self.forward_workload_recorder.finish_gpu_timing(
+                    model_gpu_timing
+                )
             if self.workload_recorder is not None:
                 self.workload_recorder.abort()
             if forward_workload_record is not None:
@@ -1758,8 +1778,13 @@ class ModelRunner:
                     completed_ns - forward_workload_record["timestamp_ns"]
                 )
                 forward_workload_record["status"] = "failed"
-                self.forward_workload_recorder.write(forward_workload_record)
+                self.forward_workload_recorder.write(
+                    forward_workload_record,
+                    model_timing=model_gpu_timing,
+                )
             raise
+        if model_gpu_timing is not None:
+            self.forward_workload_recorder.finish_gpu_timing(model_gpu_timing)
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
         if forward_workload_record is not None:
             completed_ns = time.time_ns()
@@ -1787,7 +1812,10 @@ class ModelRunner:
                     "last_graph_num_tokens",
                     getattr(graph_runner, "raw_num_token", None),
                 )
-            self.forward_workload_recorder.write(forward_workload_record)
+            self.forward_workload_recorder.write(
+                forward_workload_record,
+                model_timing=model_gpu_timing,
+            )
         if workload_record is not None:
             workload_record["execution"] = (
                 "cuda_graph" if output.can_run_graph else "eager"
@@ -1808,7 +1836,10 @@ class ModelRunner:
                 workload_record["graph_batch_size"] = getattr(
                     self.decode_cuda_graph_runner, "bs", None
                 )
-            self.workload_recorder.finish(workload_record)
+            self.workload_recorder.finish(
+                workload_record,
+                model_timing=model_gpu_timing,
+            )
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
         if (

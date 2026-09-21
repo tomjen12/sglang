@@ -352,6 +352,12 @@ class Envs:
     SGLANG_WORKLOAD_RECORD_PREFILL_PATH = EnvStr("")
     # Independent lightweight timeline for every target and draft model forward.
     SGLANG_WORKLOAD_RECORD_ALL_PATH = EnvStr("")
+    # Add asynchronous rank-zero CUDA-event timing to workload records.
+    SGLANG_WORKLOAD_RECORD_GPU_TIMING = EnvBool(False)
+    # Persist per-rank Triton autotune winners beside a recorded workload.
+    SGLANG_TRITON_AUTOTUNE_RECORD_DIR = EnvStr("")
+    # Force replay workers to use the winners recorded for their rank.
+    SGLANG_TRITON_AUTOTUNE_REPLAY_DIR = EnvStr("")
     SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)
 
     # ===================================================================
@@ -467,6 +473,8 @@ class Envs:
     SGLANG_EXTEND_KERNEL_TRACE_DIR = EnvStr(
         "/tmp/sglang_extend_kernel_traces"
     )
+    # When set, tracing remains disarmed until this marker file exists.
+    SGLANG_EXTEND_KERNEL_TRACE_ARM_FILE = EnvStr("")
     # Allocator-history buffer for /start_profile activities=["MEM"]; the
     # default truncates long windows (each entry is one alloc/free event).
     SGLANG_MEM_PROFILE_MAX_ENTRIES = EnvInt(100000)

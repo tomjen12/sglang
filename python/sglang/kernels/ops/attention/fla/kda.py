@@ -16,6 +16,11 @@ from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rul
 from sglang.kernels.ops.attention.fla.chunk_intra import chunk_kda_fwd_intra
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.fused_norm_gate import layer_norm_gated_fwd
+from sglang.kernels.ops.attention.fla.autotune_replay import (
+    find_best_config,
+    record_winner,
+    replay_pruner,
+)
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_fwd_kernel,
 )
@@ -42,6 +47,93 @@ BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 # Convert natural-log gates to log2 space before the exp2-based chunk kernels.
 # log2(e) rounded to fp32, matching flash-linear-attention.
 RCP_LN2 = 1.4426950216293335
+
+
+def _chunk_gla_fwd_o_key(arguments) -> dict:
+    return {
+        "BT": int(arguments["BT"]),
+        "IS_VARLEN": bool(arguments["IS_VARLEN"]),
+        "dtypes": {
+            name: (
+                str(arguments[name].dtype)
+                if isinstance(arguments.get(name), torch.Tensor)
+                else None
+            )
+            for name in (
+                "q",
+                "v",
+                "g",
+                "h",
+                "o",
+                "A",
+                "cu_seqlens",
+                "chunk_indices",
+            )
+        },
+    }
+
+
+def _recompute_w_u_fwd_key(arguments) -> dict:
+    return {
+        # T is intentionally included even though Triton's declared autotune
+        # key omits it. Runtime traces show different winners for different
+        # sequence lengths, and Replay must select the winner observed for the
+        # exact recorded launch.
+        "T": int(arguments["T"]),
+        "H": int(arguments["H"]),
+        "K": int(arguments["K"]),
+        "V": int(arguments["V"]),
+        "BT": int(arguments["BT"]),
+        "IS_VARLEN": bool(arguments["IS_VARLEN"]),
+        "STORE_KG": bool(arguments["STORE_KG"]),
+        "dtypes": {
+            name: (
+                str(arguments[name].dtype)
+                if isinstance(arguments.get(name), torch.Tensor)
+                else None
+            )
+            for name in (
+                "k",
+                "kg",
+                "v",
+                "beta",
+                "w",
+                "u",
+                "A",
+                "gk",
+                "cu_seqlens",
+                "chunk_indices",
+            )
+        },
+    }
+
+
+def _kda_gate_chunk_cumsum_vector_key(arguments) -> dict:
+    return {
+        "T": int(arguments["T"]),
+        "H": int(arguments["H"]),
+        "S": int(arguments["S"]),
+        "BT": int(arguments["BT"]),
+        "IS_VARLEN": bool(arguments["IS_VARLEN"]),
+        "HAS_BIAS": arguments.get("dt_bias") is not None,
+        "HAS_SCALE": arguments.get("scale") is not None,
+        "USE_LOWER_BOUND": arguments.get("lower_bound") is not None,
+        "dtypes": {
+            name: (
+                str(arguments[name].dtype)
+                if isinstance(arguments.get(name), torch.Tensor)
+                else None
+            )
+            for name in (
+                "s",
+                "A_log",
+                "dt_bias",
+                "o",
+                "cu_seqlens",
+                "chunk_indices",
+            )
+        },
+    }
 
 
 def cdiv(a: int, b: int) -> int:
@@ -648,6 +740,13 @@ _RECOMPUTE_W_U_CONFIGS = [
 recompute_w_u_fwd_kernel = triton.autotune(
     configs=_RECOMPUTE_W_U_CONFIGS,
     key=["H", "K", "V", "BT", "IS_VARLEN"],
+    prune_configs_by={
+        "early_config_prune": replay_pruner(
+            "recompute_w_u_fwd_kernel",
+            _recompute_w_u_fwd_key,
+            allow_unrecorded_kernel=True,
+        )
+    },
     **autotune_cache_kwargs,
 )(_recompute_w_u_fwd_kernel)
 
@@ -744,6 +843,34 @@ def recompute_w_u_fwd(
         DOT_PRECISION="ieee",
         **(static_config or {}),
     )
+    if static_config is None:
+        best_config = getattr(recompute_w_u_fwd_kernel, "best_config", None)
+        if best_config is not None:
+            record_winner(
+                "recompute_w_u_fwd_kernel",
+                _recompute_w_u_fwd_key(
+                    {
+                        "k": k,
+                        "kg": kg,
+                        "v": v,
+                        "beta": beta,
+                        "w": w,
+                        "u": u,
+                        "A": A,
+                        "gk": gk,
+                        "cu_seqlens": cu_seqlens,
+                        "chunk_indices": chunk_indices,
+                        "T": T,
+                        "H": H,
+                        "K": K,
+                        "V": V,
+                        "BT": BT,
+                        "STORE_KG": kg is not None,
+                        "IS_VARLEN": cu_seqlens is not None,
+                    }
+                ),
+                best_config,
+            )
     return w, u, kg
 
 
@@ -756,6 +883,11 @@ def recompute_w_u_fwd(
         for num_stages in [2, 3, 4]
     ],
     key=["BT", "IS_VARLEN"],
+    prune_configs_by={
+        "early_config_prune": replay_pruner(
+            "chunk_gla_fwd_kernel_o", _chunk_gla_fwd_o_key
+        )
+    },
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_kernel_o(
@@ -905,6 +1037,26 @@ def chunk_gla_fwd_o_gk(
         BT=BT,
         IS_VARLEN=cu_seqlens is not None,
     )
+    best_config = getattr(chunk_gla_fwd_kernel_o, "best_config", None)
+    if best_config is not None:
+        record_winner(
+            "chunk_gla_fwd_kernel_o",
+            _chunk_gla_fwd_o_key(
+                {
+                    "q": q,
+                    "v": v,
+                    "g": g,
+                    "h": h,
+                    "o": o,
+                    "A": A,
+                    "cu_seqlens": cu_seqlens,
+                    "chunk_indices": chunk_indices,
+                    "BT": BT,
+                    "IS_VARLEN": cu_seqlens is not None,
+                }
+            ),
+            best_config,
+        )
     return o
 
 
@@ -929,6 +1081,12 @@ def softplus_fwd(x):
         for num_warps in [2, 4, 8]
     ],
     key=["H", "S", "BT", "IS_VARLEN"],
+    prune_configs_by={
+        "early_config_prune": replay_pruner(
+            "kda_gate_chunk_cumsum_vector_kernel",
+            _kda_gate_chunk_cumsum_vector_key,
+        )
+    },
 )
 @triton.jit(do_not_specialize=["T"])
 def kda_gate_chunk_cumsum_vector_kernel(
@@ -1077,6 +1235,29 @@ def kda_gate_chunk_cumsum(
         S=S,
         BT=BT,
     )
+    best_config = find_best_config(kda_gate_chunk_cumsum_vector_kernel)
+    if best_config is not None:
+        record_winner(
+            "kda_gate_chunk_cumsum_vector_kernel",
+            _kda_gate_chunk_cumsum_vector_key(
+                {
+                    "s": g_org,
+                    "A_log": A_log,
+                    "dt_bias": dt_bias,
+                    "o": g,
+                    "scale": scale,
+                    "cu_seqlens": cu_seqlens,
+                    "chunk_indices": chunk_indices,
+                    "lower_bound": lower_bound,
+                    "T": T,
+                    "H": H,
+                    "S": S,
+                    "BT": BT,
+                    "IS_VARLEN": cu_seqlens is not None,
+                }
+            ),
+            best_config,
+        )
     return g
 
 
