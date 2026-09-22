@@ -14,6 +14,9 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.model_executor.workload_recorder import (
+    get_forward_workload_recorder,
+)
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     QueueCount,
@@ -24,6 +27,7 @@ from sglang.srt.observability.metrics_collector import (
 )
 from sglang.srt.observability.scheduler_stage_metrics import (
     SchedulerStageMetricsRecorder,
+    set_global_scheduler_stage_recorder,
 )
 from sglang.srt.runtime_context import (
     exports_expert_balancedness_to_prometheus,
@@ -262,9 +266,21 @@ class SchedulerMetricsReporter:
         self._scheduler_time_accounting: Optional[_SchedulerTimeAccountingSnapshot] = (
             None
         )
-        self.scheduler_stage_metrics = SchedulerStageMetricsRecorder(
-            enabled=self.enable_metrics
+        workload_recorder = get_forward_workload_recorder()
+        interval_sink = (
+            workload_recorder.write_scheduler_interval
+            if workload_recorder is not None
+            and workload_recorder.gpu_timing_enabled
+            and self.tp_rank == 0
+            and self.pp_rank == 0
+            else None
         )
+        self.scheduler_stage_metrics = SchedulerStageMetricsRecorder(
+            enabled=self.enable_metrics or interval_sink is not None,
+            interval_sink=interval_sink,
+        )
+        if self.tp_rank == 0 and self.pp_rank == 0:
+            set_global_scheduler_stage_recorder(self.scheduler_stage_metrics)
 
         self.forward_pass_device_timer: Optional[DeviceTimer] = None
 
@@ -1246,13 +1262,15 @@ class SchedulerMetricsReporter:
             self._device_timer_window_batch_count = 0
 
     def start_scheduler_time_accounting(self) -> None:
-        if not self.enable_metrics:
+        if not self.scheduler_stage_metrics.enabled:
             return
         now_wall_ns = time.monotonic_ns()
+        self.scheduler_stage_metrics.start(now_wall_ns)
+        if not self.enable_metrics:
+            return
         self._scheduler_time_accounting = _SchedulerTimeAccountingSnapshot.init(
             now_wall_ns, time.process_time_ns(), True
         )
-        self.scheduler_stage_metrics.start(now_wall_ns)
 
     def record_scheduler_active(self) -> None:
         self._record_scheduler_time(is_idle=False)

@@ -89,6 +89,10 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
 )
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SCHEDULER_STAGE_GLOO_ALL_REDUCE,
+    record_scheduler_control_stage,
+)
 from sglang.srt.runtime_context import (
     get_memory,
     get_model,
@@ -328,9 +332,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
         Must be called in the scheduler thread.
         """
-        if self.pp_rank == 0:
-            self._all_reduce_attn_groups(data, tp_reduce_op)
-        self._pp_sync(data)
+        with record_scheduler_control_stage(SCHEDULER_STAGE_GLOO_ALL_REDUCE):
+            if self.pp_rank == 0:
+                self._all_reduce_attn_groups(data, tp_reduce_op)
+            self._pp_sync(data)
 
     def _pp_sync(self, data: torch.Tensor) -> None:
         """

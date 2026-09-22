@@ -34,6 +34,7 @@ from sglang.srt.managers.mm_utils import (
     unwrap_shm_features,
 )
 from sglang.srt.observability.scheduler_stage_metrics import (
+    SCHEDULER_STAGE_GLOO_BROADCAST,
     SCHEDULER_STAGE_RECV_REQUESTS,
     SchedulerStageMetricsRecorder,
     scheduler_stage_method,
@@ -167,6 +168,7 @@ class SchedulerRequestReceiver:
                 recv_reqs = None
         return recv_reqs
 
+    @scheduler_stage_method(SCHEDULER_STAGE_GLOO_BROADCAST)
     def _broadcast_reqs_across_ranks(
         self, recv_reqs: Optional[List], local_reqs: Optional[List] = None
     ) -> List:

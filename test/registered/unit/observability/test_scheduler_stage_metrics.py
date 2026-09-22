@@ -32,6 +32,8 @@ class TestSchedulerStageMetricsRecorder(CustomTestCase):
                 "run_batch",
                 "sanity_check_cache",
                 "idle",
+                "gloo_broadcast",
+                "gloo_all_reduce",
             },
         )
 
@@ -59,6 +61,37 @@ class TestSchedulerStageMetricsRecorder(CustomTestCase):
             },
         )
         self.assertEqual(sum(wall_ns.values()), 100)
+
+    def test_interval_sink_receives_mutually_exclusive_segments(self):
+        intervals = []
+        recorder = SchedulerStageMetricsRecorder(
+            enabled=True,
+            interval_sink=lambda stage, start, end: intervals.append(
+                (stage, start, end)
+            ),
+        )
+        recorder.start(wall_ns=0)
+
+        with patch(
+            "sglang.srt.observability.scheduler_stage_metrics.time.monotonic_ns",
+            side_effect=[10, 30, 50, 80],
+        ):
+            outer = recorder.enter(SCHEDULER_STAGE_GET_NEXT_BATCH)
+            inner = recorder.enter(SCHEDULER_STAGE_PROCESS_QUEUE)
+            recorder.exit(inner)
+            recorder.exit(outer)
+        recorder.drain(wall_ns=100)
+
+        self.assertEqual(
+            intervals,
+            [
+                ("other", 0, 10),
+                ("get_next_batch_to_run", 10, 30),
+                ("process_queue", 30, 50),
+                ("get_next_batch_to_run", 50, 80),
+                ("other", 80, 100),
+            ],
+        )
 
     def test_decorator_restores_stage_after_exception(self):
         recorder = SchedulerStageMetricsRecorder(enabled=True)

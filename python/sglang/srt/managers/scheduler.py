@@ -286,6 +286,9 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
+from sglang.srt.model_executor.workload_recorder import (
+    scheduler_batch_workload_method,
+)
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
@@ -4206,6 +4209,7 @@ class Scheduler(
                 batch.sampling_info = sched_sampling_info
 
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
+    @scheduler_batch_workload_method
     def run_batch(
         self,
         batch: ScheduleBatch,

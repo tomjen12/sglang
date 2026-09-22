@@ -37,6 +37,8 @@ SCHEDULER_STAGE_RUN_BATCH = "run_batch"
 SCHEDULER_STAGE_PROCESS_BATCH_RESULT = "process_batch_result"
 SCHEDULER_STAGE_SANITY_CHECK_CACHE = "sanity_check_cache"
 SCHEDULER_STAGE_IDLE = "idle"
+SCHEDULER_STAGE_GLOO_BROADCAST = "gloo_broadcast"
+SCHEDULER_STAGE_GLOO_ALL_REDUCE = "gloo_all_reduce"
 
 SCHEDULER_STAGE_CATEGORIES = (
     SCHEDULER_STAGE_OTHER,
@@ -48,8 +50,11 @@ SCHEDULER_STAGE_CATEGORIES = (
     SCHEDULER_STAGE_PROCESS_BATCH_RESULT,
     SCHEDULER_STAGE_SANITY_CHECK_CACHE,
     SCHEDULER_STAGE_IDLE,
+    SCHEDULER_STAGE_GLOO_BROADCAST,
+    SCHEDULER_STAGE_GLOO_ALL_REDUCE,
 )
 _SCHEDULER_STAGE_CATEGORY_SET = frozenset(SCHEDULER_STAGE_CATEGORIES)
+_GLOBAL_SCHEDULER_STAGE_RECORDER: SchedulerStageMetricsRecorder | None = None
 
 
 @dataclass(slots=True)
@@ -63,6 +68,7 @@ class SchedulerStageMetricsRecorder:
     """
 
     enabled: bool
+    interval_sink: Callable[[str, int, int], None] | None = None
     _current_stage: str = SCHEDULER_STAGE_OTHER
     _trace_stage: str | None = None
     _last_wall_ns: int | None = None
@@ -125,8 +131,29 @@ class SchedulerStageMetricsRecorder:
 
     def _sample(self, wall_ns: int) -> None:
         assert self._last_wall_ns is not None
+        if self.interval_sink is not None and wall_ns > self._last_wall_ns:
+            self.interval_sink(
+                self._current_stage, self._last_wall_ns, wall_ns
+            )
         self._wall_ns[self._current_stage] += wall_ns - self._last_wall_ns
         self._last_wall_ns = wall_ns
+
+
+def set_global_scheduler_stage_recorder(
+    recorder: SchedulerStageMetricsRecorder | None,
+) -> None:
+    global _GLOBAL_SCHEDULER_STAGE_RECORDER
+    _GLOBAL_SCHEDULER_STAGE_RECORDER = recorder
+
+
+@contextmanager
+def record_scheduler_control_stage(stage: str) -> Iterator[None]:
+    recorder = _GLOBAL_SCHEDULER_STAGE_RECORDER
+    if recorder is None:
+        yield
+        return
+    with recorder.record(stage):
+        yield
 
 
 _F = TypeVar("_F", bound=Callable)

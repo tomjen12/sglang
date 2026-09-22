@@ -18,8 +18,9 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TypeVar, cast
 
 import torch
 
@@ -33,6 +34,14 @@ _PREFILL_WORKLOAD_RECORDER: Optional["PrefillWorkloadRecorder"] = None
 _PREFILL_EXECUTION_CONTEXT: contextvars.ContextVar[
     Optional[Dict[str, Any]]
 ] = contextvars.ContextVar("prefill_workload_execution_context", default=None)
+_SCHEDULER_BATCH_CONTEXT: contextvars.ContextVar[
+    Optional[Dict[str, Any]]
+] = contextvars.ContextVar("scheduler_batch_workload_context", default=None)
+
+
+def get_forward_workload_recorder() -> Optional["ForwardWorkloadRecorder"]:
+    """Return the process-local recorder without creating one."""
+    return _FORWARD_WORKLOAD_RECORDER
 
 
 def get_or_create_forward_workload_recorder(
@@ -195,6 +204,22 @@ def build_forward_workload_record(
         spec_algorithm_name = str(spec_algorithm)
     global_forward_mode = getattr(forward_batch, "global_forward_mode", None)
     wrapper_context = _PREFILL_EXECUTION_CONTEXT.get()
+    scheduler_context = _SCHEDULER_BATCH_CONTEXT.get()
+
+    if scheduler_context is not None:
+        scheduler_context["contained_forwards"].append(
+            {
+                "role": model_role,
+                "forward_id": forward_pass_id,
+                "draft_model_idx": draft_model_idx,
+                "mode": mode.name,
+                "wrapper": (
+                    wrapper_context.get("wrapper")
+                    if wrapper_context is not None
+                    else None
+                ),
+            }
+        )
 
     prefill = _phase_shape(context_query_lens, context_kv_lens)
     prefill["request_ids"] = context_request_ids
@@ -208,6 +233,16 @@ def build_forward_workload_record(
         "completed_timestamp_ns": None,
         "host_elapsed_ns": None,
         "forward_id": forward_pass_id,
+        "scheduler_batch_id": (
+            scheduler_context["scheduler_batch_id"]
+            if scheduler_context is not None
+            else None
+        ),
+        "scheduler_forward_iter": (
+            scheduler_context["forward_iter"]
+            if scheduler_context is not None
+            else None
+        ),
         "mode": mode.name,
         "logical_batch_size": int(forward_batch.batch_size),
         "input_token_count": (
@@ -286,6 +321,26 @@ class _ForwardWrite:
     wrapper_timing: Optional[_ForwardGpuTiming] = None
 
 
+@dataclass
+class _SchedulerBatchGpuTiming:
+    anchor_event: Any
+    device: Any
+    start_events: Dict[str, Any]
+    streams: Dict[str, Any]
+    end_events: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class _SchedulerBatchWrite:
+    record: Dict[str, Any]
+    timing: _SchedulerBatchGpuTiming
+
+
+@dataclass
+class _SchedulerIntervalWrite:
+    record: Dict[str, Any]
+
+
 def _add_gpu_timing_fields(
     record: Dict[str, Any],
     *,
@@ -321,6 +376,120 @@ def _add_gpu_timing_fields(
         record["dspark_prefill_gpu_elapsed_ms"] = record["gpu_elapsed_ms"]
 
 
+def _add_scheduler_batch_gpu_timing_fields(
+    record: Dict[str, Any], timing: _SchedulerBatchGpuTiming
+) -> None:
+    if timing.end_events is None:
+        raise RuntimeError("scheduler batch GPU timing has no end events")
+    for event in timing.end_events.values():
+        event.synchronize()
+
+    spans: Dict[str, Dict[str, float]] = {}
+    for name, start_event in timing.start_events.items():
+        end_event = timing.end_events[name]
+        start_ms = timing.anchor_event.elapsed_time(start_event)
+        end_ms = timing.anchor_event.elapsed_time(end_event)
+        spans[name] = {
+            "start_offset_ms": round(start_ms, 6),
+            "end_offset_ms": round(end_ms, 6),
+            "elapsed_ms": round(start_event.elapsed_time(end_event), 6),
+        }
+
+    start_ms = min(span["start_offset_ms"] for span in spans.values())
+    end_ms = max(span["end_offset_ms"] for span in spans.values())
+    record["gpu_start_offset_ms"] = round(start_ms, 6)
+    record["gpu_end_offset_ms"] = round(end_ms, 6)
+    record["gpu_elapsed_ms"] = round(end_ms - start_ms, 6)
+    record["gpu_timing_scope"] = "scheduler_batch_stream_envelope"
+    record["gpu_stream_spans"] = spans
+
+
+_F = TypeVar("_F", bound=Callable)
+
+
+def scheduler_batch_workload_method(func: _F) -> _F:
+    """Record the host and GPU envelope of one Scheduler.run_batch call."""
+
+    @wraps(func)
+    def wrapper(self, batch, *args, **kwargs):
+        recorder = _FORWARD_WORKLOAD_RECORDER
+        if recorder is None or not recorder.gpu_timing_enabled:
+            return func(self, batch, *args, **kwargs)
+
+        forward_iter = int(getattr(self, "forward_ct", 0)) + 1
+        context = {
+            "scheduler_batch_id": forward_iter,
+            "forward_iter": forward_iter,
+            "contained_forwards": [],
+        }
+        token = _SCHEDULER_BATCH_CONTEXT.set(context)
+        timing = recorder.start_scheduler_batch_gpu_timing(
+            getattr(self, "device"),
+            {
+                "schedule": getattr(self, "schedule_stream", None),
+                "forward": getattr(self, "forward_stream", None),
+                "copy": getattr(self, "copy_stream", None),
+            },
+        )
+        record = _build_scheduler_batch_record(batch, forward_iter)
+        try:
+            result = func(self, batch, *args, **kwargs)
+            record["status"] = "completed"
+            return result
+        except BaseException:
+            record["status"] = "failed"
+            raise
+        finally:
+            completed_ns = time.time_ns()
+            record["completed_timestamp_ns"] = completed_ns
+            record["host_elapsed_ns"] = completed_ns - record["timestamp_ns"]
+            record["forward_iter"] = int(
+                getattr(batch, "forward_iter", forward_iter)
+            )
+            record["scheduler_batch_id"] = record["forward_iter"]
+            record["after_idle_gap"] = bool(
+                getattr(batch, "after_idle_gap", False)
+            )
+            record["contained_forwards"] = list(context["contained_forwards"])
+            contained_modes = {
+                item["mode"] for item in record["contained_forwards"]
+            }
+            if "TARGET_VERIFY" in contained_modes:
+                record["mode"] = "TARGET_VERIFY"
+            try:
+                recorder.finish_scheduler_batch_gpu_timing(timing)
+            finally:
+                _SCHEDULER_BATCH_CONTEXT.reset(token)
+            recorder.write_scheduler_batch(record, timing)
+
+    return cast(_F, wrapper)
+
+
+def _build_scheduler_batch_record(batch: Any, forward_iter: int) -> Dict[str, Any]:
+    mode = getattr(batch, "forward_mode", None)
+    mode_name = getattr(mode, "name", str(mode) if mode is not None else None)
+    input_ids = getattr(batch, "input_ids", None)
+    reqs = list(getattr(batch, "reqs", None) or [])
+    return {
+        "schema_version": 1,
+        "record_type": "scheduler_batch",
+        "timestamp_ns": time.time_ns(),
+        "completed_timestamp_ns": None,
+        "host_elapsed_ns": None,
+        "scheduler_batch_id": forward_iter,
+        "forward_iter": forward_iter,
+        "mode": mode_name,
+        "schedule_mode": mode_name,
+        "logical_batch_size": len(reqs),
+        "input_token_count": int(input_ids.numel()) if input_ids is not None else 0,
+        "extend_token_count": int(getattr(batch, "extend_num_tokens", 0) or 0),
+        "request_ids": [str(getattr(req, "rid", "")) for req in reqs],
+        "after_idle_gap": bool(getattr(batch, "after_idle_gap", False)),
+        "contained_forwards": [],
+        "status": "started",
+    }
+
+
 class ForwardWorkloadRecorder:
     """Bounded asynchronous writer for the all-forward workload timeline."""
 
@@ -336,17 +505,38 @@ class ForwardWorkloadRecorder:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.output_dir / "forwards.jsonl"
+        self.scheduler_batch_path = self.output_dir / "scheduler_batches.jsonl"
+        self.scheduler_interval_path = (
+            self.output_dir / "scheduler_intervals.jsonl"
+        )
         self.metadata_path = self.output_dir / "run_metadata.json"
         self._file = self.path.open("a", encoding="utf-8", buffering=1024 * 1024)
         self._flush_interval = flush_interval
         self.gpu_timing_enabled = gpu_timing_enabled
+        self._scheduler_batch_file = (
+            self.scheduler_batch_path.open(
+                "a", encoding="utf-8", buffering=1024 * 1024
+            )
+            if gpu_timing_enabled
+            else None
+        )
+        self._scheduler_interval_file = (
+            self.scheduler_interval_path.open(
+                "a", encoding="utf-8", buffering=1024 * 1024
+            )
+            if gpu_timing_enabled
+            else None
+        )
         self._queue: queue.Queue = queue.Queue(maxsize=queue_size)
         self._gpu_anchor_event = None
+        self._epoch_monotonic_offset_ns = time.time_ns() - time.monotonic_ns()
         self._pending_dspark: Dict[int, _ForwardWrite] = {}
         self._closed = False
         self.dropped_records = 0
         self.dropped_after_close = 0
         self.written_records = 0
+        self.written_scheduler_batches = 0
+        self.written_scheduler_intervals = 0
         self.write_errors = 0
         self._stats_lock = threading.Lock()
         self._write_error_logged = False
@@ -398,10 +588,24 @@ class ForwardWorkloadRecorder:
             ),
             "timing_semantics": (
                 "host wall-clock plus optional asynchronous CUDA-event spans; "
-                "GPU spans include bubbles inside each timed forward but not "
-                "gaps between forwards"
+                "forward GPU spans include bubbles inside each timed forward; "
+                "scheduler batch GPU spans are the min/max envelope across the "
+                "schedule, forward, and result-copy streams"
             ),
             "gpu_timing_enabled": self.gpu_timing_enabled,
+            "timeline_files": {
+                "forwards": self.path.name,
+                "scheduler_batches": (
+                    self.scheduler_batch_path.name
+                    if self.gpu_timing_enabled
+                    else None
+                ),
+                "scheduler_intervals": (
+                    self.scheduler_interval_path.name
+                    if self.gpu_timing_enabled
+                    else None
+                ),
+            },
         }
         tmp_path = self.metadata_path.with_suffix(".json.tmp")
         tmp_path.write_text(
@@ -436,6 +640,60 @@ class ForwardWorkloadRecorder:
         end.record(stream)
         timing.end_event = end
 
+    def start_scheduler_batch_gpu_timing(
+        self, device: Any, streams: Dict[str, Any]
+    ) -> _SchedulerBatchGpuTiming:
+        if not self.gpu_timing_enabled:
+            raise RuntimeError("scheduler batch GPU timing is disabled")
+        device_module = torch.get_device_module(device)
+        unique_streams: Dict[str, Any] = {}
+        seen_streams: set[int] = set()
+        for name, stream in streams.items():
+            if stream is None:
+                continue
+            stream_identity = int(
+                getattr(stream, "cuda_stream", id(stream))
+            )
+            if stream_identity in seen_streams:
+                continue
+            seen_streams.add(stream_identity)
+            unique_streams[name] = stream
+        if not unique_streams:
+            unique_streams["current"] = device_module.current_stream(device)
+
+        first_stream = next(iter(unique_streams.values()))
+        with self._stats_lock:
+            if self._gpu_anchor_event is None:
+                self._gpu_anchor_event = device_module.Event(enable_timing=True)
+                self._gpu_anchor_event.record(first_stream)
+            anchor = self._gpu_anchor_event
+
+        start_events: Dict[str, Any] = {}
+        for name, stream in unique_streams.items():
+            event = device_module.Event(enable_timing=True)
+            event.record(stream)
+            start_events[name] = event
+        return _SchedulerBatchGpuTiming(
+            anchor_event=anchor,
+            device=device,
+            start_events=start_events,
+            streams=unique_streams,
+        )
+
+    @staticmethod
+    def finish_scheduler_batch_gpu_timing(
+        timing: _SchedulerBatchGpuTiming,
+    ) -> None:
+        if timing.end_events is not None:
+            raise RuntimeError("scheduler batch GPU timing was already finished")
+        device_module = torch.get_device_module(timing.device)
+        end_events: Dict[str, Any] = {}
+        for name, stream in timing.streams.items():
+            event = device_module.Event(enable_timing=True)
+            event.record(stream)
+            end_events[name] = event
+        timing.end_events = end_events
+
     def write(
         self,
         record: Dict[str, Any],
@@ -466,7 +724,45 @@ class ForwardWorkloadRecorder:
         item.wrapper_timing = timing
         self._enqueue_write(item)
 
-    def _enqueue_write(self, item: _ForwardWrite) -> None:
+    def write_scheduler_batch(
+        self, record: Dict[str, Any], timing: _SchedulerBatchGpuTiming
+    ) -> None:
+        self._enqueue_write(_SchedulerBatchWrite(record=record, timing=timing))
+
+    def write_scheduler_interval(
+        self, stage: str, start_monotonic_ns: int, end_monotonic_ns: int
+    ) -> None:
+        if not self.gpu_timing_enabled or end_monotonic_ns <= start_monotonic_ns:
+            return
+        reason = {
+            "idle": "scheduler_idle_or_stalled",
+            "gloo_broadcast": "gloo_broadcast",
+            "gloo_all_reduce": "gloo_all_reduce",
+        }.get(stage, "scheduler_processing")
+        self._enqueue_write(
+            _SchedulerIntervalWrite(
+                record={
+                    "schema_version": 1,
+                    "record_type": "scheduler_interval",
+                    "reason": reason,
+                    "stage": stage,
+                    "timestamp_ns": (
+                        start_monotonic_ns + self._epoch_monotonic_offset_ns
+                    ),
+                    "completed_timestamp_ns": (
+                        end_monotonic_ns + self._epoch_monotonic_offset_ns
+                    ),
+                    "host_elapsed_ns": end_monotonic_ns - start_monotonic_ns,
+                    "monotonic_start_ns": start_monotonic_ns,
+                    "monotonic_end_ns": end_monotonic_ns,
+                }
+            )
+        )
+
+    def _enqueue_write(
+        self,
+        item: _ForwardWrite | _SchedulerBatchWrite | _SchedulerIntervalWrite,
+    ) -> None:
         with self._stats_lock:
             if self._closed:
                 self.dropped_after_close += 1
@@ -484,18 +780,35 @@ class ForwardWorkloadRecorder:
                 if item is self._STOP:
                     break
                 try:
-                    _add_gpu_timing_fields(
-                        item.record,
-                        model_timing=item.model_timing,
-                        wrapper_timing=item.wrapper_timing,
-                    )
-                    self._file.write(
+                    if isinstance(item, _ForwardWrite):
+                        _add_gpu_timing_fields(
+                            item.record,
+                            model_timing=item.model_timing,
+                            wrapper_timing=item.wrapper_timing,
+                        )
+                        target_file = self._file
+                        self.written_records += 1
+                    elif isinstance(item, _SchedulerBatchWrite):
+                        _add_scheduler_batch_gpu_timing_fields(
+                            item.record, item.timing
+                        )
+                        assert self._scheduler_batch_file is not None
+                        target_file = self._scheduler_batch_file
+                        self.written_scheduler_batches += 1
+                    else:
+                        assert self._scheduler_interval_file is not None
+                        target_file = self._scheduler_interval_file
+                        self.written_scheduler_intervals += 1
+                    target_file.write(
                         json.dumps(item.record, separators=(",", ":")) + "\n"
                     )
-                    self.written_records += 1
                     pending += 1
                     if pending >= self._flush_interval:
                         self._file.flush()
+                        if self._scheduler_batch_file is not None:
+                            self._scheduler_batch_file.flush()
+                        if self._scheduler_interval_file is not None:
+                            self._scheduler_interval_file.flush()
                         pending = 0
                 except Exception:
                     self.write_errors += 1
@@ -517,6 +830,26 @@ class ForwardWorkloadRecorder:
         }
         self._file.write(json.dumps(stats_record, separators=(",", ":")) + "\n")
         self._file.flush()
+        if self._scheduler_batch_file is not None:
+            batch_stats = {
+                **stats_record,
+                "record_type": "scheduler_batch_recorder_stats",
+                "written_records": self.written_scheduler_batches,
+            }
+            self._scheduler_batch_file.write(
+                json.dumps(batch_stats, separators=(",", ":")) + "\n"
+            )
+            self._scheduler_batch_file.flush()
+        if self._scheduler_interval_file is not None:
+            interval_stats = {
+                **stats_record,
+                "record_type": "scheduler_interval_recorder_stats",
+                "written_records": self.written_scheduler_intervals,
+            }
+            self._scheduler_interval_file.write(
+                json.dumps(interval_stats, separators=(",", ":")) + "\n"
+            )
+            self._scheduler_interval_file.flush()
 
     def close(self) -> None:
         global _FORWARD_WORKLOAD_RECORDER
@@ -530,6 +863,10 @@ class ForwardWorkloadRecorder:
         self._queue.put(self._STOP)
         self._thread.join()
         self._file.close()
+        if self._scheduler_batch_file is not None:
+            self._scheduler_batch_file.close()
+        if self._scheduler_interval_file is not None:
+            self._scheduler_interval_file.close()
         if _FORWARD_WORKLOAD_RECORDER is self:
             _FORWARD_WORKLOAD_RECORDER = None
 

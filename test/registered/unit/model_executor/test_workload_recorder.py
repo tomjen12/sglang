@@ -23,6 +23,7 @@ from sglang.srt.model_executor.workload_recorder import (
     _ForwardGpuTiming,
     _MoeCopySlot,
     _PendingRecord,
+    _SchedulerBatchGpuTiming,
     build_forward_workload_record,
     build_prefill_workload_record,
     get_moe_layer_ids,
@@ -436,6 +437,64 @@ class TestAllForwardWorkloadRecorder(unittest.TestCase):
             self.assertEqual(
                 record["gpu_timing_scope"], "dspark_prefill_wrapper"
             )
+
+    def test_scheduler_batch_and_interval_sidecars(self):
+        class FakeEvent:
+            def __init__(self, timestamp):
+                self.timestamp = timestamp
+
+            def synchronize(self):
+                pass
+
+            def elapsed_time(self, other):
+                return other.timestamp - self.timestamp
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer = ForwardWorkloadRecorder(tmpdir, gpu_timing_enabled=True)
+            timing = _SchedulerBatchGpuTiming(
+                anchor_event=FakeEvent(0.0),
+                device="cuda:0",
+                start_events={
+                    "schedule": FakeEvent(2.0),
+                    "forward": FakeEvent(3.0),
+                },
+                streams={"schedule": object(), "forward": object()},
+                end_events={
+                    "schedule": FakeEvent(4.0),
+                    "forward": FakeEvent(8.0),
+                },
+            )
+            writer.write_scheduler_batch(
+                {
+                    "schema_version": 1,
+                    "record_type": "scheduler_batch",
+                    "forward_iter": 12,
+                },
+                timing,
+            )
+            writer.write_scheduler_interval("gloo_broadcast", 100, 250)
+            writer.close()
+
+            batch_record = json.loads(
+                (Path(tmpdir) / "scheduler_batches.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+            self.assertEqual(batch_record["gpu_start_offset_ms"], 2.0)
+            self.assertEqual(batch_record["gpu_end_offset_ms"], 8.0)
+            self.assertEqual(batch_record["gpu_elapsed_ms"], 6.0)
+            self.assertEqual(
+                batch_record["gpu_timing_scope"],
+                "scheduler_batch_stream_envelope",
+            )
+
+            interval_record = json.loads(
+                (Path(tmpdir) / "scheduler_intervals.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+            self.assertEqual(interval_record["reason"], "gloo_broadcast")
+            self.assertEqual(interval_record["host_elapsed_ns"], 150)
 
 
 class TestPrefillWorkloadWriter(unittest.TestCase):
