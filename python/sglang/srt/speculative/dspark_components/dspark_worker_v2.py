@@ -602,10 +602,30 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "draft_kv_injection_enabled": True,
             },
         }
-        with prefill_workload_execution_context(workload_context):
-            batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=CaptureHiddenMode.FULL
+        prefill_bs = len(batch.extend_lens or [])
+        prefill_tokens = int(sum(batch.extend_lens or []))
+        context_lens = [
+            int(prefix) + int(query)
+            for prefix, query in zip(
+                batch.prefix_lens or [],
+                batch.extend_lens or [],
+                strict=True,
             )
+        ]
+        context_label = (
+            str(context_lens[0])
+            if len(context_lens) == 1
+            else str(context_lens)
+        )
+        target_prefill_label = (
+            f"target_prefill[bs={prefill_bs} tok={prefill_tokens} "
+            f"ctx={context_label}]"
+        )
+        with prefill_workload_execution_context(workload_context):
+            with torch.profiler.record_function(target_prefill_label):
+                batch_output = self.target_worker.forward_batch_generation(
+                    batch, capture_hidden_mode=CaptureHiddenMode.FULL
+                )
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_TARGET, next_token_ids)
@@ -656,14 +676,17 @@ class DSparkWorkerV2(BaseSpecWorker):
                 (draft_seq_lens + ctx_lens - 1).to(torch.int64), repeats
             )
         try:
-            self._kv_injector.inject_target_hidden(
-                target_hidden=logits_output.hidden_states,
-                cache_loc=batch.out_cache_loc,
-                positions=positions,
-                state_slot=state_slot,
-                final_pos=final_pos,
-                target_hidden_is_projected=target_hidden_is_projected,
-            )
+            with torch.profiler.record_function(
+                f"draft_kv[bs={prefill_bs} tok={prefill_tokens}]"
+            ):
+                self._kv_injector.inject_target_hidden(
+                    target_hidden=logits_output.hidden_states,
+                    cache_loc=batch.out_cache_loc,
+                    positions=positions,
+                    state_slot=state_slot,
+                    final_pos=final_pos,
+                    target_hidden_is_projected=target_hidden_is_projected,
+                )
         except BaseException:
             commit_prefill_dspark_injection(
                 self.model_runner.forward_pass_id, status="failed"
