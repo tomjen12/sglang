@@ -22,7 +22,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
-from sglang.srt.model_executor.extend_kernel_tracer import ExtendKernelTracer
+from sglang.srt.model_executor.prefill_kernel_tracer import PrefillKernelTracer
 from sglang.srt.model_executor.workload_recorder import (
     commit_prefill_dspark_injection,
     dspark_prefill_gpu_timing,
@@ -150,12 +150,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.model_runner = target_worker.model_runner
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
-        self._extend_kernel_tracer = ExtendKernelTracer(
-            enabled=envs.SGLANG_EXTEND_KERNEL_TRACE.get(),
-            output_dir=envs.SGLANG_EXTEND_KERNEL_TRACE_DIR.get(),
+        self._prefill_kernel_tracer = PrefillKernelTracer(
+            enabled=envs.SGLANG_PREFILL_KERNEL_TRACE.get(),
+            output_dir=envs.SGLANG_PREFILL_KERNEL_TRACE_DIR.get(),
             tp_rank=self.ps.tp_rank,
             device=self.device,
-            arm_file=envs.SGLANG_EXTEND_KERNEL_TRACE_ARM_FILE.get(),
+            arm_file=envs.SGLANG_PREFILL_KERNEL_TRACE_ARM_FILE.get(),
+            record_shapes=envs.SGLANG_PROFILE_RECORD_SHAPES.get(),
+            with_stack=envs.SGLANG_PROFILE_WITH_STACK.get(),
         )
 
         self._draft_is_moe = draft_is_deepseek_v4()
@@ -533,7 +535,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 return self._forward_prefill(batch, on_publish)
 
             source_forward_id = int(self.model_runner.forward_pass_id) + 1
-            with self._extend_kernel_tracer.capture(
+            with self._prefill_kernel_tracer.capture(
                 source_forward_id=source_forward_id,
                 request_ids=[
                     str(getattr(req, "rid", "")) for req in batch.reqs
@@ -543,7 +545,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             ), dspark_prefill_gpu_timing(source_forward_id, self.device):
                 output = self._forward_prefill(batch, on_publish)
             if (
-                self._extend_kernel_tracer.enabled
+                self._prefill_kernel_tracer.enabled
                 and int(self.model_runner.forward_pass_id) != source_forward_id
             ):
                 raise RuntimeError(

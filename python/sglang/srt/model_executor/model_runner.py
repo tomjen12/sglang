@@ -350,17 +350,17 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
-        all_forward_record_path = envs.SGLANG_WORKLOAD_RECORD_ALL_PATH.get()
+        forward_record_path = envs.SGLANG_WORKLOAD_RECORD_FORWARD_PATH.get()
         workload_gpu_timing_enabled = (
             envs.SGLANG_WORKLOAD_RECORD_GPU_TIMING.get()
-            and bool(all_forward_record_path)
+            and bool(forward_record_path)
         )
         self.forward_workload_recorder = (
             get_or_create_forward_workload_recorder(
-                all_forward_record_path,
+                forward_record_path,
                 gpu_timing_enabled=workload_gpu_timing_enabled,
             )
-            if all_forward_record_path
+            if forward_record_path
             and self.ps.tp_rank == 0
             and self.ps.pp_rank == 0
             else None

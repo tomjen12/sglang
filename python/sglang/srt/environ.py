@@ -351,7 +351,7 @@ class Envs:
     # request shapes plus per-layer MoE counts into this output directory.
     SGLANG_WORKLOAD_RECORD_PREFILL_PATH = EnvStr("")
     # Independent lightweight timeline for every target and draft model forward.
-    SGLANG_WORKLOAD_RECORD_ALL_PATH = EnvStr("")
+    SGLANG_WORKLOAD_RECORD_FORWARD_PATH = EnvStr("")
     # Add asynchronous rank-zero CUDA-event timing to workload records.
     SGLANG_WORKLOAD_RECORD_GPU_TIMING = EnvBool(False)
     # Persist per-rank Triton autotune winners beside a recorded workload.
@@ -467,14 +467,14 @@ class Envs:
     # precedence when both are set.
     SGLANG_GRAPH_BATCH_CAPTURE = EnvBool(False)
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
-    # Emit one CPU+GPU Chrome trace for every live DSpark target EXTEND.
+    # Emit one CPU+GPU Chrome trace for every live DSpark target prefill.
     # This is intended for correctness analysis, not latency measurement.
-    SGLANG_EXTEND_KERNEL_TRACE = EnvBool(False)
-    SGLANG_EXTEND_KERNEL_TRACE_DIR = EnvStr(
-        "/tmp/sglang_extend_kernel_traces"
+    SGLANG_PREFILL_KERNEL_TRACE = EnvBool(False)
+    SGLANG_PREFILL_KERNEL_TRACE_DIR = EnvStr(
+        "/tmp/sglang_prefill_kernel_traces"
     )
     # When set, tracing remains disarmed until this marker file exists.
-    SGLANG_EXTEND_KERNEL_TRACE_ARM_FILE = EnvStr("")
+    SGLANG_PREFILL_KERNEL_TRACE_ARM_FILE = EnvStr("")
     # Allocator-history buffer for /start_profile activities=["MEM"]; the
     # default truncates long windows (each entry is one alloc/free event).
     SGLANG_MEM_PROFILE_MAX_ENTRIES = EnvInt(100000)

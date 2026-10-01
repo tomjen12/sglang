@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.model_executor.extend_kernel_tracer import ExtendKernelTracer
+from sglang.srt.model_executor.prefill_kernel_tracer import PrefillKernelTracer
 
 
 class _FakeProfiler:
@@ -26,19 +26,23 @@ class _FakeProfiler:
         Path(path).write_text('{"traceEvents":[]}', encoding="utf-8")
 
 
-class TestExtendKernelTracer(unittest.TestCase):
+class TestPrefillKernelTracer(unittest.TestCase):
     def test_records_compressed_trace_and_manifest(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             profiler = _FakeProfiler()
-            tracer = ExtendKernelTracer(
+            tracer = PrefillKernelTracer(
                 enabled=True,
                 output_dir=tmpdir,
                 tp_rank=0,
                 device=torch.device("cuda:0"),
+                record_shapes=False,
+                with_stack=True,
             )
             with (
                 patch("torch.cuda.synchronize") as synchronize,
-                patch("torch.profiler.profile", return_value=profiler),
+                patch(
+                    "torch.profiler.profile", return_value=profiler
+                ) as profile,
                 patch(
                     "torch.profiler.record_function",
                     side_effect=lambda _: nullcontext(),
@@ -55,6 +59,8 @@ class TestExtendKernelTracer(unittest.TestCase):
             self.assertTrue(profiler.started)
             self.assertTrue(profiler.stopped)
             self.assertEqual(synchronize.call_count, 2)
+            self.assertFalse(profile.call_args.kwargs["record_shapes"])
+            self.assertTrue(profile.call_args.kwargs["with_stack"])
             trace_path = (
                 Path(tmpdir)
                 / "agentx_prefill_source_42-TP-0.trace.json.gz"
@@ -71,11 +77,13 @@ class TestExtendKernelTracer(unittest.TestCase):
             self.assertEqual(manifest["query_sizes"], [512])
             self.assertEqual(manifest["prefix_kv_sizes"], [4096])
             self.assertEqual(manifest["status"], "completed")
+            self.assertFalse(manifest["record_shapes"])
+            self.assertTrue(manifest["with_stack"])
 
     def test_nonzero_rank_is_disabled(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir) / "traces"
-            tracer = ExtendKernelTracer(
+            tracer = PrefillKernelTracer(
                 enabled=True,
                 output_dir=str(output_dir),
                 tp_rank=1,
@@ -94,7 +102,7 @@ class TestExtendKernelTracer(unittest.TestCase):
 
     def test_missing_arm_file_skips_profiler(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            tracer = ExtendKernelTracer(
+            tracer = PrefillKernelTracer(
                 enabled=True,
                 output_dir=tmpdir,
                 tp_rank=0,

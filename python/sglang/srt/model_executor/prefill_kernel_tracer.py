@@ -14,8 +14,8 @@ from typing import Iterator, Sequence
 import torch
 
 
-class ExtendKernelTracer:
-    """Record each qualifying EXTEND as an independent Chrome trace."""
+class PrefillKernelTracer:
+    """Record each qualifying prefill as an independent Chrome trace."""
 
     def __init__(
         self,
@@ -25,10 +25,14 @@ class ExtendKernelTracer:
         tp_rank: int,
         device: torch.device,
         arm_file: str = "",
+        record_shapes: bool = True,
+        with_stack: bool = False,
     ) -> None:
         self.enabled = bool(enabled) and tp_rank == 0
         self.tp_rank = int(tp_rank)
         self.device = device
+        self.record_shapes = bool(record_shapes)
+        self.with_stack = bool(with_stack)
         self.output_dir = Path(output_dir).expanduser()
         self.arm_file = (
             Path(arm_file).expanduser() if arm_file else None
@@ -58,7 +62,7 @@ class ExtendKernelTracer:
         request_ids = [str(value) for value in request_ids]
         if len(query_sizes) != len(prefix_kv_sizes):
             raise ValueError(
-                "EXTEND kernel trace query and prefix lengths must have equal size"
+                "Prefill kernel trace query and prefix lengths must have equal size"
             )
 
         stem = (
@@ -82,8 +86,8 @@ class ExtendKernelTracer:
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
-            record_shapes=True,
-            with_stack=False,
+            record_shapes=self.record_shapes,
+            with_stack=self.with_stack,
             profile_memory=False,
         )
         profiler.start()
@@ -107,7 +111,7 @@ class ExtendKernelTracer:
 
             manifest_record = {
                 "schema_version": 1,
-                "record_type": "extend_kernel_trace",
+                "record_type": "prefill_kernel_trace",
                 "source_forward_id": source_forward_id,
                 "started_timestamp_ns": started_timestamp_ns,
                 "completed_timestamp_ns": time.time_ns(),
@@ -120,6 +124,8 @@ class ExtendKernelTracer:
                 "prefix_kv_sizes": prefix_kv_sizes,
                 "sum_query_tokens": sum(query_sizes),
                 "sum_prefix_kv_tokens": sum(prefix_kv_sizes),
+                "record_shapes": self.record_shapes,
+                "with_stack": self.with_stack,
             }
             line = json.dumps(manifest_record, separators=(",", ":")) + "\n"
             fd = os.open(
