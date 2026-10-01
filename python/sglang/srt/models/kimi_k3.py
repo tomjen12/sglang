@@ -134,6 +134,7 @@ from sglang.srt.utils.common import (
     require_mlp_sync,
     set_weight_attrs,
 )
+from sglang.srt.utils.nvtx_utils import profile_range
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
@@ -2314,6 +2315,10 @@ class KimiK3DecoderLayer(nn.Module):
         self.is_moe = config.is_moe
         self.layer_idx = layer_idx
         self._dp_attention = is_dp_attention_enabled()
+        attention_type = "kda" if config.is_kda_layer(layer_idx) else "full"
+        self._attention_profile_label = (
+            f"kimi_k3.attention[layer={layer_idx:03d},type={attention_type}]"
+        )
         # mlp-sync (DP attention OR MoE a2a/EP) pads extend batches to
         # attn_tp multiples; attention must then run on the real rows only.
         self._trim_padded_attn = require_mlp_sync()
@@ -2621,9 +2626,10 @@ class KimiK3DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        hidden_states = self._run_self_attn(
-            hidden_states, positions, forward_batch, zero_allocator
-        )
+        with profile_range(self._attention_profile_label):
+            hidden_states = self._run_self_attn(
+                hidden_states, positions, forward_batch, zero_allocator
+            )
         # standard path returns a full-size residual to the next layer, so
         # complete the deferred o_proj reduction as a plain all-reduce
         hidden_states, _, _ = self._finish_attn_reduce(
@@ -2691,9 +2697,10 @@ class KimiK3DecoderLayer(nn.Module):
             prefix_sum = None
 
         # ---- Attention ----
-        hidden_states = self._run_self_attn(
-            hidden_states, positions, forward_batch, zero_allocator
-        )
+        with profile_range(self._attention_profile_label):
+            hidden_states = self._run_self_attn(
+                hidden_states, positions, forward_batch, zero_allocator
+            )
 
         # ---- Complete o_proj's deferred reduction ----
         # SP-MoE takes precedence (reduce-scatter to this rank's token shard);
