@@ -7,9 +7,11 @@ import torch
 from sglang.srt.rocm_muse_spark.replay_capture import (
     CaptureSelector,
     ReplayBundleWriter,
+    apply_routing_override,
     force_eager_model_runner,
     record_route_workload,
     record_tensor_descriptor,
+    routing_override,
     runtime_metadata_capture,
     snapshot_forward_batch,
     snapshot_kv_cache,
@@ -168,3 +170,35 @@ def test_lightweight_runtime_capture_stores_only_descriptors_and_counts(tmp_path
     assert metadata["layer_0.input.stream"]["shape"] == [8, 8192]
     assert metadata["layer_0.routing"]["global_token_counts"] == [1, 2, 0, 1]
     assert not list(writer.directory.glob("*.safetensors"))
+
+
+def test_routing_override_is_scoped_and_validates_shape():
+    scores = torch.full((2, 2), 0.5)
+    natural = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    replacement = torch.tensor([[4, 5], [6, 7]], dtype=torch.int32)
+
+    with routing_override({3: replacement}):
+        actual_scores, actual_ids = apply_routing_override(
+            layer=3, topk_scores=scores, topk_ids=natural
+        )
+        assert actual_scores is scores
+        assert actual_ids.dtype == natural.dtype
+        assert actual_ids.tolist() == replacement.tolist()
+
+        with pytest.raises(ValueError, match="has shape"):
+            apply_routing_override(
+                layer=3,
+                topk_scores=scores,
+                topk_ids=torch.zeros((1, 2), dtype=torch.int32),
+            )
+
+    with routing_override({3: replacement.to(torch.int64)}):
+        with pytest.raises(ValueError, match="expected cpu/torch.int32"):
+            apply_routing_override(
+                layer=3, topk_scores=scores, topk_ids=natural
+            )
+
+    _, restored = apply_routing_override(
+        layer=3, topk_scores=scores, topk_ids=natural
+    )
+    assert restored is natural

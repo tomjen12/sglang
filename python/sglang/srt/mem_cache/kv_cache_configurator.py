@@ -602,11 +602,10 @@ class KVCacheConfigurator:
             if reason is not None:
                 raise ValueError(reason)
 
-        if not self.spec_algorithm.is_none() and self.is_draft_worker:
-            assert self.memory_pool_config is not None, (
-                "Draft worker requires memory_pool_config"
-            )
+        if self.memory_pool_config is not None:
             config = self.memory_pool_config
+        elif not self.spec_algorithm.is_none() and self.is_draft_worker:
+            raise AssertionError("Draft worker requires memory_pool_config")
         else:
             config = self._resolve_memory_pool_config(pre_model_load_memory)
 

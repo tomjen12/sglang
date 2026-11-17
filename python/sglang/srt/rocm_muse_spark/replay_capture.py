@@ -32,6 +32,9 @@ _MARKERS_ENABLED = bool(os.getenv(CAPTURE_DIR_ENV)) or os.getenv(
 _ACTIVE_METADATA: ContextVar[RuntimeMetadataCollector | None] = ContextVar(
     "muse_replay_metadata", default=None
 )
+_ACTIVE_ROUTING_OVERRIDE: ContextVar[Mapping[int, torch.Tensor] | None] = ContextVar(
+    "muse_replay_routing_override", default=None
+)
 
 
 def markers_enabled() -> bool:
@@ -169,6 +172,39 @@ def record_route_workload(
             local_start=local_start,
             local_experts=local_experts,
         )
+
+
+@contextlib.contextmanager
+def routing_override(
+    layer_topk_ids: Mapping[int, torch.Tensor] | None,
+) -> Iterator[None]:
+    """Install replay-only routed expert ids after sequence-parallel gather."""
+    token = _ACTIVE_ROUTING_OVERRIDE.set(layer_topk_ids)
+    try:
+        yield
+    finally:
+        _ACTIVE_ROUTING_OVERRIDE.reset(token)
+
+
+def apply_routing_override(
+    *, layer: int, topk_scores: torch.Tensor, topk_ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    overrides = _ACTIVE_ROUTING_OVERRIDE.get()
+    if overrides is None or layer not in overrides:
+        return topk_scores, topk_ids
+    replacement = overrides[layer]
+    if replacement.shape != topk_ids.shape:
+        raise ValueError(
+            f"Replay routing override layer {layer} has shape "
+            f"{tuple(replacement.shape)}, expected {tuple(topk_ids.shape)}."
+        )
+    if replacement.device != topk_ids.device or replacement.dtype != topk_ids.dtype:
+        raise ValueError(
+            f"Replay routing override layer {layer} has "
+            f"{replacement.device}/{replacement.dtype}, expected "
+            f"{topk_ids.device}/{topk_ids.dtype}."
+        )
+    return topk_scores, replacement
 
 
 _FORWARD_BATCH_TENSORS = (

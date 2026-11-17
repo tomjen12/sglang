@@ -88,6 +88,7 @@ from sglang.srt.rocm_muse_spark import (
     router_pooler,
 )
 from sglang.srt.rocm_muse_spark.replay_capture import (
+    apply_routing_override,
     record_route_workload,
     record_tensor_descriptor,
     replay_scope,
@@ -1267,6 +1268,11 @@ class MuseSpark1xMoE(nn.Module):
                     0, ids, torch.ones_like(ids, dtype=torch.int32)
                 )
         if target_verify and self.layer_idx < 10:
+            topk_scores, topk_ids = apply_routing_override(
+                layer=self.layer_idx,
+                topk_scores=topk_scores,
+                topk_ids=topk_ids,
+            )
             record_route_workload(
                 layer=self.layer_idx,
                 topk_ids=topk_ids,
