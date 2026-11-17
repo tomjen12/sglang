@@ -87,6 +87,11 @@ from sglang.srt.rocm_muse_spark import (
     mxfp4_moe,
     router_pooler,
 )
+from sglang.srt.rocm_muse_spark.replay_capture import (
+    record_route_workload,
+    record_tensor_descriptor,
+    replay_scope,
+)
 from sglang.srt.rocm_muse_spark.attention_kv_write import (
     FUSED_QKV_CACHE,
     QK_ROPE_CACHE,
@@ -1261,6 +1266,14 @@ class MuseSpark1xMoE(nn.Module):
                 self.expert_load.index_add_(
                     0, ids, torch.ones_like(ids, dtype=torch.int32)
                 )
+        if target_verify and self.layer_idx < 10:
+            record_route_workload(
+                layer=self.layer_idx,
+                topk_ids=topk_ids,
+                num_experts=self.num_experts,
+                local_start=self.local_expert_start,
+                local_experts=self.num_local_experts,
+            )
         if (
             sp is None
             and self._finalize_ar is not None
@@ -1877,16 +1890,27 @@ class MuseSpark1xModel(nn.Module):
             )
             with tuned:
                 for i, layer in enumerate(self.layers):
-                    stream, attn_input, attn_input_fp8 = layer(
-                        positions,
-                        stream,
-                        forward_batch,
-                        attn_input=attn_input,
-                        ffn_boundary=self._ffn_boundaries[i],
-                        pre_norm_dtype=final_pre_norm_dtype if i == last else None,
-                        sp=sp,
-                        attn_input_fp8=attn_input_fp8,
-                    )
+                    if i < 10:
+                        record_tensor_descriptor(f"layer_{i}.input.stream", stream)
+                        record_tensor_descriptor(
+                            f"layer_{i}.input.attn", attn_input
+                        )
+                    with replay_scope(f"target/layer_{i}"):
+                        stream, attn_input, attn_input_fp8 = layer(
+                            positions,
+                            stream,
+                            forward_batch,
+                            attn_input=attn_input,
+                            ffn_boundary=self._ffn_boundaries[i],
+                            pre_norm_dtype=final_pre_norm_dtype if i == last else None,
+                            sp=sp,
+                            attn_input_fp8=attn_input_fp8,
+                        )
+                    if i < 10:
+                        record_tensor_descriptor(f"layer_{i}.output.stream", stream)
+                        record_tensor_descriptor(
+                            f"layer_{i}.output.attn", attn_input
+                        )
                     if i in self.layers_to_capture:
                         aux_hidden_states.append(stream.to(torch.bfloat16))
             # == self.norm(norm_input).to(bf16) from the last boundary
@@ -1899,7 +1923,12 @@ class MuseSpark1xModel(nn.Module):
                 ]
         else:
             for i, layer in enumerate(self.layers):
-                stream = layer(positions, stream, forward_batch)
+                if i < 10:
+                    record_tensor_descriptor(f"layer_{i}.input.stream", stream)
+                with replay_scope(f"target/layer_{i}"):
+                    stream = layer(positions, stream, forward_batch)
+                if i < 10:
+                    record_tensor_descriptor(f"layer_{i}.output.stream", stream)
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(stream.to(torch.bfloat16))
             norm_input = stream.to(torch.bfloat16)

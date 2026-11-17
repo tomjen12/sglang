@@ -299,6 +299,12 @@ class TestInitializeDummyWeights(CustomTestCase):
         model.register_buffer(
             "w13_weight_scale_inv", torch.zeros(4, 2, dtype=torch.uint8)
         )
+        model.register_buffer(
+            "w2_weight_scale", torch.zeros(4, 2, dtype=torch.uint8)
+        )
+        model.register_buffer(
+            "w13_packed_weight", torch.empty(64, dtype=torch.uint8)
+        )
 
         initialize_dummy_weights(model, low=0.25, high=0.75)
 
@@ -307,6 +313,14 @@ class TestInitializeDummyWeights(CustomTestCase):
                 model.w13_weight_scale_inv, torch.full((4, 2), 127, dtype=torch.uint8)
             )
         )
+        self.assertTrue(
+            torch.equal(
+                model.w2_weight_scale, torch.full((4, 2), 127, dtype=torch.uint8)
+            )
+        )
+        packed = model.w13_packed_weight.clone()
+        initialize_dummy_weights(model, low=0.25, high=0.75)
+        self.assertTrue(torch.equal(model.w13_packed_weight, packed))
 
 
 if __name__ == "__main__":
