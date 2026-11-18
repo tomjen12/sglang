@@ -1276,6 +1276,7 @@ class MuseSpark1xMoE(nn.Module):
             record_route_workload(
                 layer=self.layer_idx,
                 topk_ids=topk_ids,
+                topk_scores=topk_scores,
                 num_experts=self.num_experts,
                 local_start=self.local_expert_start,
                 local_experts=self.num_local_experts,

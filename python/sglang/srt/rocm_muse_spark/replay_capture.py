@@ -35,6 +35,9 @@ _ACTIVE_METADATA: ContextVar[RuntimeMetadataCollector | None] = ContextVar(
 _ACTIVE_ROUTING_OVERRIDE: ContextVar[Mapping[int, torch.Tensor] | None] = ContextVar(
     "muse_replay_routing_override", default=None
 )
+_ACTIVE_ROUTING_SCORE_OVERRIDE: ContextVar[
+    Mapping[int, torch.Tensor] | None
+] = ContextVar("muse_replay_routing_score_override", default=None)
 
 
 def markers_enabled() -> bool:
@@ -110,6 +113,7 @@ class RuntimeMetadataCollector:
         *,
         layer: int,
         topk_ids: torch.Tensor,
+        topk_scores: torch.Tensor | None,
         num_experts: int,
         local_start: int,
         local_experts: int,
@@ -120,6 +124,14 @@ class RuntimeMetadataCollector:
         self.metadata[f"layer_{layer}.routing"] = {
             "rows": int(topk_ids.shape[0]),
             "top_k": int(topk_ids.shape[-1]),
+            "topk_ids": topk_ids.detach()
+            .to(device="cpu", dtype=torch.int32)
+            .tolist(),
+            "topk_scores": (
+                topk_scores.detach().to(device="cpu", dtype=torch.float32).tolist()
+                if topk_scores is not None
+                else None
+            ),
             "num_experts": int(num_experts),
             "local_expert_start": int(local_start),
             "local_experts": int(local_experts),
@@ -159,6 +171,7 @@ def record_route_workload(
     *,
     layer: int,
     topk_ids: torch.Tensor,
+    topk_scores: torch.Tensor | None = None,
     num_experts: int,
     local_start: int,
     local_experts: int,
@@ -168,6 +181,7 @@ def record_route_workload(
         collector.route(
             layer=layer,
             topk_ids=topk_ids,
+            topk_scores=topk_scores,
             num_experts=num_experts,
             local_start=local_start,
             local_experts=local_experts,
@@ -177,13 +191,32 @@ def record_route_workload(
 @contextlib.contextmanager
 def routing_override(
     layer_topk_ids: Mapping[int, torch.Tensor] | None,
+    layer_topk_scores: Mapping[int, torch.Tensor] | None = None,
 ) -> Iterator[None]:
     """Install replay-only routed expert ids after sequence-parallel gather."""
     token = _ACTIVE_ROUTING_OVERRIDE.set(layer_topk_ids)
+    score_token = _ACTIVE_ROUTING_SCORE_OVERRIDE.set(layer_topk_scores)
     try:
         yield
     finally:
+        _ACTIVE_ROUTING_SCORE_OVERRIDE.reset(score_token)
         _ACTIVE_ROUTING_OVERRIDE.reset(token)
+
+
+def get_routing_override(layer: int) -> torch.Tensor | None:
+    """Return replay-only routed expert ids for one target layer."""
+    overrides = _ACTIVE_ROUTING_OVERRIDE.get()
+    if overrides is None:
+        return None
+    return overrides.get(layer)
+
+
+def get_routing_score_override(layer: int) -> torch.Tensor | None:
+    """Return replay-only routing scores for one target layer."""
+    overrides = _ACTIVE_ROUTING_SCORE_OVERRIDE.get()
+    if overrides is None:
+        return None
+    return overrides.get(layer)
 
 
 def apply_routing_override(
@@ -204,7 +237,22 @@ def apply_routing_override(
             f"{replacement.device}/{replacement.dtype}, expected "
             f"{topk_ids.device}/{topk_ids.dtype}."
         )
-    return topk_scores, replacement
+    score_overrides = _ACTIVE_ROUTING_SCORE_OVERRIDE.get()
+    if score_overrides is None or layer not in score_overrides:
+        return topk_scores, replacement
+    score_replacement = score_overrides[layer]
+    if (
+        score_replacement.shape != topk_scores.shape
+        or score_replacement.device != topk_scores.device
+        or score_replacement.dtype != topk_scores.dtype
+    ):
+        raise ValueError(
+            f"Replay routing score override layer {layer} has "
+            f"{tuple(score_replacement.shape)} {score_replacement.device}/"
+            f"{score_replacement.dtype}, expected {tuple(topk_scores.shape)} "
+            f"{topk_scores.device}/{topk_scores.dtype}."
+        )
+    return score_replacement, replacement
 
 
 _FORWARD_BATCH_TENSORS = (
