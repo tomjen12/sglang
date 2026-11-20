@@ -7,7 +7,11 @@ import torch
 
 import sglang.srt.model_loader.loader as loader_mod
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.model_loader.loader import DefaultModelLoader, ModelOptModelLoader
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    DummyModelLoader,
+    ModelOptModelLoader,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -15,6 +19,23 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDefaultModelLoader(CustomTestCase):
+    def test_dummy_loader_accepts_only_deterministic_seed(self):
+        loader = DummyModelLoader(
+            LoadConfig(
+                load_format="dummy",
+                model_loader_extra_config={"seed": 20261117},
+            )
+        )
+        self.assertEqual(loader.seed, 20261117)
+
+        with self.assertRaisesRegex(ValueError, "Unexpected.*keys"):
+            DummyModelLoader(
+                LoadConfig(
+                    load_format="dummy",
+                    model_loader_extra_config={"seed": 1, "unknown": True},
+                )
+            )
+
     def test_load_weights_only_precedes_postprocessing(self):
         events = []
         model = Mock()

@@ -73,6 +73,17 @@ from sglang.srt.model_executor.runner_utils.pool import (
 from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.models.dflash import DFlashMLAAttention
 from sglang.srt.platforms import current_platform
+from sglang.srt.rocm_muse_spark.replay_capture import (
+    CaptureSelector,
+    describe_forward_batch,
+    describe_iteration_ids,
+    describe_kv_cache,
+    force_eager_model_runner,
+    replay_scope,
+    replay_scoped,
+    runtime_metadata_capture,
+    tensor_descriptor,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
@@ -607,6 +618,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self._need_mamba_verify_commit = False
+        self._muse_replay_capture = CaptureSelector()
         self.page_size = get_schedule().page_size
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
         self.draft_window_size: Optional[int] = get_spec().speculative_draft_window_size
@@ -3678,6 +3690,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
+    @replay_scoped("spec_cycle")
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -3893,6 +3906,28 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         block_size = int(self.block_size)
+        replay_writer = self._muse_replay_capture.next(
+            rank=self._target_tp_rank,
+            width=block_size,
+            min_prefix_length=(
+                int(batch.seq_lens.min().item())
+                if self._muse_replay_capture.enabled
+                else None
+            ),
+        )
+        if replay_writer is not None:
+            replay_writer.write_metadata(
+                "cycle",
+                {
+                    "width": block_size,
+                    "batch_size": bs,
+                    "target_tp_rank": self._target_tp_rank,
+                    "draft_tp_size": int(self.draft_parallel_layout.attn_tp_size),
+                    "capture_target_checkpoint_loaded": True,
+                    "replay_target_weights": "synthetic_seeded",
+                    "synthetic_seed": int(self._target_worker.random_seed),
+                },
+            )
         self._ensure_draft_block_buffers(bs)
         assert self._draft_block_ids_buf is not None
         assert self._draft_block_positions_buf is not None
@@ -4055,6 +4090,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             global_num_token_non_padded_cpu=bs * block_size,
             can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
         )
+        if replay_writer is not None:
+            # Layer shape/routing hooks execute in Python. Capture runs eager;
+            # the separate golden profiler run retains serving graph mode.
+            forward_batch.can_run_decode_cuda_graph = False
         # The draft block writes the whole window. A compact draft reads its
         # own `req_to_token` rows over its own lengths.
         draft_translator = self.draft_model_runner.runner_ids
@@ -4087,12 +4126,43 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
 
         self._join_aux()
+        if replay_writer is not None:
+            draft_metadata = describe_forward_batch(forward_batch)
+            draft_metadata["inputs"] = {
+                name: tensor_descriptor(value)
+                for name, value in {
+                    "block_ids": block_ids,
+                    "positions_2d": positions_2d,
+                    "verify_out_cache_loc_2d": verify_out_cache_loc_2d,
+                    "prefix_lens": prefix_lens,
+                    "bonus_tokens": draft_input.bonus_tokens,
+                }.items()
+            }
+            draft_metadata["iteration"] = describe_iteration_ids(draft_plan)
+            draft_metadata["cache"] = describe_kv_cache(
+                draft_plan,
+                draft_translator,
+                self.draft_model_runner.token_to_kv_pool,
+                layer_ids=range(len(self.draft_model.layers)),
+            )
+            replay_writer.write_metadata("draft_forward_input", draft_metadata)
+
         with (
             torch.inference_mode(),
             draft_tp_context(self.draft_parallel_layout),
         ):
-            draft_out = self.draft_model_runner.forward(forward_batch)
+            with (
+                runtime_metadata_capture(replay_writer, "draft_layers"),
+                force_eager_model_runner(self.draft_model_runner),
+            ):
+                with replay_scope("draft/forward"):
+                    draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
+        if replay_writer is not None:
+            replay_writer.write_metadata(
+                "draft_forward_output",
+                {"hidden_states": tensor_descriptor(draft_logits_output.hidden_states)},
+            )
 
         if (
             self._is_domino
@@ -4261,8 +4331,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         confidence, verify_token_budget, layout = self._plan_verify(
             batch=batch, draft_input=draft_input, prefix_lens=prefix_lens
         )
-        run_compact = self._verify_planner is not None and (
-            self._verify_planner.should_run_compact(layout=layout)
+        run_compact = (
+            replay_writer is None
+            and self._verify_planner is not None
+            and (self._verify_planner.should_run_compact(layout=layout))
         )
         if run_compact:
             target_out = self._run_compact_verify(
@@ -4295,14 +4367,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self.target_worker,
                 defer_metadata_init=get_parallel().attn_dp_enabled,
             )
+            if replay_writer is not None:
+                verify_forward_batch.can_run_decode_cuda_graph = False
             batch.seq_lens_cpu = seq_lens_cpu_backup
             batch.seq_lens_sum = seq_lens_sum_backup
 
-            # Idle-DP guard (NPU): an eager idle rank's raw counts and a replaying rank's
-            # padded bucket disagree on DP-gather offsets, so any idle rank forces eager.
+            # Idle-DP guard: an eager idle rank's raw counts and a replaying rank
+            # assume different DP-gather offsets, so any idle rank forces eager.
             if (
-                _is_npu
-                and get_parallel().attn_dp_enabled
+                get_parallel().attn_dp_enabled
                 and verify_forward_batch.original_global_num_tokens_cpu is not None
                 and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
             ):
@@ -4314,14 +4387,38 @@ class DFlashWorkerV2(BaseSpecWorker):
             if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
                 verify_forward_batch.can_run_decode_cuda_graph = False
 
-            target_out = self.target_worker.forward_batch_generation(
-                batch=None,
-                forward_batch=verify_forward_batch,
-                is_verify=True,
-                skip_attn_backend_init=(
-                    None if _is_npu or get_parallel().attn_dp_enabled else True
-                ),
-            )
+            if replay_writer is not None:
+                target_metadata = describe_forward_batch(verify_forward_batch)
+                target_metadata["inputs"] = {
+                    name: tensor_descriptor(value)
+                    for name, value in {
+                        "draft_tokens": draft_tokens,
+                        "positions_2d": positions_2d,
+                        "verify_out_cache_loc_2d": verify_out_cache_loc_2d,
+                        "prefix_lens": prefix_lens,
+                    }.items()
+                }
+                target_metadata["cache"] = describe_kv_cache(
+                    iteration_ids,
+                    self.model_runner.runner_ids,
+                    self.model_runner.token_to_kv_pool,
+                    layer_ids=range(10),
+                )
+                replay_writer.write_metadata("target_verify", target_metadata)
+
+            with (
+                runtime_metadata_capture(replay_writer, "target_layers"),
+                force_eager_model_runner(self.model_runner),
+            ):
+                with replay_scope("target/verify"):
+                    target_out = self.target_worker.forward_batch_generation(
+                        batch=None,
+                        forward_batch=verify_forward_batch,
+                        is_verify=True,
+                        skip_attn_backend_init=(
+                            None if _is_npu or get_parallel().attn_dp_enabled else True
+                        ),
+                    )
             routed_experts_output = target_out.routed_experts_output
             indexer_topk_output = target_out.indexer_topk_output
             kv_weight_version_record = target_out.kv_weight_version_record
@@ -4524,6 +4621,34 @@ class DFlashWorkerV2(BaseSpecWorker):
                         iteration_ids, IdSpaceKind.SLIDING_WINDOW
                     )
                 ),
+            )
+
+        if replay_writer is not None:
+            output_metadata = {
+                name: value
+                for name, value in {
+                    "draft_tokens": draft_tokens,
+                    "accept_len": accept_len,
+                    "commit_lens": commit_lens,
+                    "bonus": bonus,
+                    "out_tokens": out_tokens,
+                    "new_seq_lens": new_seq_lens,
+                    "target_hidden_states": hidden,
+                }.items()
+                if isinstance(value, torch.Tensor)
+            }
+            replay_writer.write_metadata(
+                "cycle_output",
+                {
+                    name: tensor_descriptor(value)
+                    for name, value in output_metadata.items()
+                },
+            )
+            replay_writer.finish(
+                {
+                    "execution": ("graph" if can_run_cuda_graph else "eager"),
+                    "complete_after_post_verify_draft_kv_write": True,
+                }
             )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.

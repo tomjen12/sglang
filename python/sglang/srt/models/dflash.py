@@ -61,6 +61,10 @@ from sglang.srt.models.utils import (
     bind_or_assign,
     keeps_no_quant_config,
 )
+from sglang.srt.rocm_muse_spark.replay_capture import (
+    record_tensor_descriptor,
+    replay_scope,
+)
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
@@ -1436,15 +1440,30 @@ class DFlashDraftModel(nn.Module):
             )
 
         output_conv = None
-        for layer in self.layers:
-            hidden_states, residual, output_conv = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-                output_conv,
-                **attn_kwargs,
-            )
+        for i, layer in enumerate(self.layers):
+            record_tensor_descriptor(f"layer_{i}.input.hidden", hidden_states)
+            record_tensor_descriptor(f"layer_{i}.input.residual", residual)
+            if output_conv is not None:
+                record_tensor_descriptor(f"layer_{i}.input.conv", output_conv[0])
+                record_tensor_descriptor(
+                    f"layer_{i}.input.conv_coefficients", output_conv[1]
+                )
+            with replay_scope(f"draft/layer_{i}"):
+                hidden_states, residual, output_conv = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    output_conv,
+                    **attn_kwargs,
+                )
+            record_tensor_descriptor(f"layer_{i}.output.hidden", hidden_states)
+            record_tensor_descriptor(f"layer_{i}.output.residual", residual)
+            if output_conv is not None:
+                record_tensor_descriptor(f"layer_{i}.output.conv", output_conv[0])
+                record_tensor_descriptor(
+                    f"layer_{i}.output.conv_coefficients", output_conv[1]
+                )
 
         if hidden_states.numel() != 0:
             if residual is None:

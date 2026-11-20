@@ -46,6 +46,7 @@ def is_post_capture_kv_active(
         return (
             spec_algorithm.is_dflash_family()
             and not get_spec().speculative_dflash_draft_kv_ring
+            and token_to_kv_pool_allocator is not None
             and token_to_kv_pool_allocator.get_kvcache().post_capture_active
         )
     return post_capture_kv_sizing_planned(server_args) and current_platform.is_cuda()

@@ -1520,10 +1520,14 @@ class DummyModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        if load_config.model_loader_extra_config:
+        extra_config = dict(load_config.model_loader_extra_config or {})
+        self.seed = int(
+            extra_config.pop("seed", os.getenv("SGLANG_DUMMY_WEIGHT_SEED", 1234))
+        )
+        if extra_config:
             raise ValueError(
-                f"Model loader extra config is not supported for "
-                f"load format {load_config.load_format}"
+                f"Unexpected model loader extra config keys for "
+                f"{load_config.load_format}: {sorted(extra_config)}"
             )
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -1553,7 +1557,7 @@ class DummyModelLoader(BaseModelLoader):
 
             # NOTE(woosuk): For accurate performance evaluation, we assign
             # random values to the weights.
-            initialize_dummy_weights(model)
+            initialize_dummy_weights(model, seed=self.seed)
 
             post_load_weights(model)
 
